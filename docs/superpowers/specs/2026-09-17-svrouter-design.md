@@ -12,7 +12,7 @@ Not in scope for M2: exact-output swaps (the app quotes with the V4 Quoter and a
 
 | Item | Value |
 |---|---|
-| Universal Router (current, D38) | `0x06afBA43fd06227fA663b0dAeCF536F6eaA6BF99`, `poolManager()` = `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
+| Universal Router (current, D38) | `0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99`, `poolManager()` = `0x8366a39CC670B4001A1121B8F6A443A643e40951` |
 | Permit2 | `0x000000000022D473030F116dDEE9F6B43aC78BA3` |
 | V4 Quoter (off-chain quotes only) | `0x8dc178efb8111bb0973dd9d722ebeff267c98f94` |
 | Test pool, LONG: AI / NVDA | id `0x8b7f6b0cc404947b4c5d32b02353b82d432c98d61497a07f2a42f4ed5a3c19ee`; currency0 = AI `0x68082B7EA5eE83cA3BD992f038ef02c0180b9Ba3`, currency1 = NVDA `0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC`, fee `8388608` (dynamic flag), tickSpacing 200, hooks `0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544` (Doppler); tiny liquidity (about 0.014 NVDA) so fork tests trade dust |
@@ -100,7 +100,7 @@ Sell-side fees arrive in the token being sold (the README's Fees table says so);
 - `renounceOwnership` is overridden to revert: a router with no owner could never change its fee wallet again.
 - The holder rate is a spot `balanceOf` check with no lock-up, so at 0 bps anyone who borrows a Suits NFT for one transaction pays no fee. This follows D34 as written; whether that is acceptable, or the discount should be smaller than 100 %, is Kobe's and the client's call.
 - Because the settle is exact, a hook that charges a delta on the input side would make every trade on that pool revert rather than partially fill. None of the listed hooks does (MemeHook is afterSwap-only on the output; Doppler's dynamic fee is an LP fee inside the swap); the fork tests prove it on the three pools.
-- The Suits NFT guard tolerates a codeless address, a reverting `balanceOf` and a malformed reply (low-level static call, reply must be exactly 32 bytes); any of those costs the holder rate, never the trade.
+- The Suits NFT guard tolerates a codeless address, a reverting `balanceOf`, a malformed reply and a call that exhausts its 100,000 gas allowance (low-level static call, reply must be exactly 32 bytes); any of those costs the holder rate, never the trade.
 - Fee-on-transfer or rebasing input tokens are unsupported: the router receives less than `amountIn`, cannot cover the settle, and the call reverts.
 - `Trade` events are user-triggerable with any pool key and any tokens (a self-made pool with self-made tokens), so anything that indexes them must filter by known pools rather than trust the fields.
 - Exact-output ("I want exactly N tokens") is out of scope; the app derives the input amount from a Quoter exact-output quote and executes exact input.
