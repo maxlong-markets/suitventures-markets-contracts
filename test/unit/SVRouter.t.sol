@@ -20,6 +20,7 @@ import {SVRouter} from "../../src/SVRouter.sol";
 import {ISVRouter} from "../../src/interfaces/ISVRouter.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockERC721} from "../mocks/MockERC721.sol";
+import {MockERC721ShortReply} from "../mocks/MockERC721ShortReply.sol";
 import {MockUniversalRouter} from "../mocks/MockUniversalRouter.sol";
 import {Permit2Signer} from "../utils/Permit2Signer.sol";
 
@@ -32,6 +33,17 @@ contract RevertingSuitsNft {
     }
 }
 
+/// @dev A Suits NFT whose `balanceOf` never returns: it hashes until the call's gas allowance is gone. The
+///      router's static call is capped, so this must cost the holder rate and nothing else.
+contract GasBurningSuitsNft {
+    function balanceOf(address) external view returns (uint256 total) {
+        total = uint256(blockhash(block.number - 1));
+        while (gasleft() > 0) {
+            total = uint256(keccak256(abi.encode(total)));
+        }
+    }
+}
+
 /// @notice Shared fixture for the unit suite: the real Permit2 etched at its canonical address, two sorted
 ///         MockERC20s as the pool's currencies, a MockERC721 as the Suits NFT (nobody holds one), the
 ///         MockUniversalRouter, and an SVRouter at the spec's deploy values. The fuzz suite inherits it too.
@@ -41,12 +53,22 @@ abstract contract SVRouterTestBase is Test {
     uint256 internal constant USER_KEY = 0xA11CE;
     uint256 internal constant STRANGER_KEY = 0xB0BB1E;
 
-    /// @dev The standard trade of this suite, at the deploy rate of 50 bps.
+    /// @dev The standard trade of this suite, at the deploy rate of 50 bps. `MIN_OUT` is what the caller demands
+    ///      and `OUTPUT` is what the pool actually pays; they are deliberately different, and `OUTPUT` is the
+    ///      larger, so a router that returned or logged `amountOutMin` instead of the measured balance
+    ///      difference would fail every assertion below.
     uint128 internal constant AMOUNT_IN = 1_000e18;
     uint128 internal constant FEE = AMOUNT_IN * 50 / 10_000; // 5e18
     uint128 internal constant NET = AMOUNT_IN - FEE; // 995e18
-    uint128 internal constant OUTPUT = 3e18;
+    uint128 internal constant MIN_OUT = 3e18; // the caller's amountOutMin
+    uint128 internal constant OUTPUT = 4e18; // what the mock router pays out: strictly more
     uint256 internal constant MINT = 10_000e18;
+
+    /// @dev The selector of the single-transfer `permitTransferFrom`, written out because the name is
+    ///      overloaded in Permit2, which makes `.selector` on it ambiguous. A wrong value here could not pass
+    ///      unnoticed: `_expectOnePermitPull` asserts that a call carrying it really is made.
+    bytes4 internal constant PERMIT_PULL =
+        bytes4(keccak256("permitTransferFrom(((address,uint256),uint256,uint256),(address,uint256),address,bytes)"));
 
     address internal user;
     address internal stranger;
@@ -80,7 +102,9 @@ abstract contract SVRouterTestBase is Test {
             currency1: Currency.wrap(address(token1)),
             fee: 3000,
             tickSpacing: 60,
-            hooks: IHooks(address(0))
+            // A non-zero hook, as every real pool has: an assertion on the key's hooks would be vacuous
+            // against address(0). The mock never calls it, so it needs no code.
+            hooks: IHooks(makeAddr("pool hook"))
         });
 
         nft = new MockERC721();
@@ -153,6 +177,19 @@ abstract contract SVRouterTestBase is Test {
         bytes memory signature = _sign(USER_KEY, permit);
         vm.prank(user);
         return router.swapExactIn(p, permit, signature);
+    }
+
+    /// @dev Pins that the call under test never reaches Permit2, which is how "the router refuses before it
+    ///      pulls funds" is proved: after a revert every balance is rolled back, so a balance assertion cannot
+    ///      tell the two orders apart.
+    function _expectNoPermitPull() internal {
+        vm.expectCall(address(permit2), abi.encodePacked(PERMIT_PULL), 0);
+    }
+
+    /// @dev The opposite: the call does reach Permit2 exactly once, so a revert from there is Permit2's own
+    ///      judgement on the signature or the nonce, not a check of the router's.
+    function _expectOnePermitPull() internal {
+        vm.expectCall(address(permit2), abi.encodePacked(PERMIT_PULL), 1);
     }
 }
 
@@ -450,35 +487,13 @@ contract SVRouterTest is SVRouterTestBase {
         assertEq(feeOnOdd, 5e15, "half a basis point of the odd wei is dropped");
     }
 
-    function test_feeFor_uses_the_standard_rate_when_the_nft_call_reverts() public {
-        // Deployed before the prank: a CREATE from this test would consume it.
-        RevertingSuitsNft unwell = new RevertingSuitsNft();
-        vm.prank(owner);
-        router.setSuitsNft(address(unwell));
-
-        (uint256 fee, bool holderRate) = router.feeFor(user, AMOUNT_IN);
-        assertEq(fee, FEE, "the standard rate, and no revert out of feeFor");
-        assertFalse(holderRate, "a reverting balanceOf is not a holder");
-    }
-
-    function test_feeFor_uses_the_standard_rate_when_the_nft_address_has_no_code() public {
-        address noCode = makeAddr("an address with no code");
-        vm.prank(owner);
-        router.setSuitsNft(noCode);
-        assertEq(noCode.code.length, 0, "the fixture's premise");
-
-        (uint256 fee, bool holderRate) = router.feeFor(user, AMOUNT_IN);
-        assertEq(fee, FEE, "the standard rate, and no revert out of feeFor");
-        assertFalse(holderRate, "an address without code is not a holder");
-    }
-
     // -------------------------------------------------------------------------------------------------------
     // swapExactIn: the happy paths (spec section 4)
     // -------------------------------------------------------------------------------------------------------
 
     function test_swapExactIn_buys_currency1_with_currency0() public {
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -501,7 +516,7 @@ contract SVRouterTest is SVRouterTestBase {
 
     function test_swapExactIn_sells_currency1_for_currency0() public {
         universalRouter.setOutput(address(token0), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(false, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(false, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token1), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -521,9 +536,45 @@ contract SVRouterTest is SVRouterTestBase {
         assertEq(token1.balanceOf(address(router)), 0, "the router holds no tokenIn");
     }
 
+    function test_swapExactIn_returns_the_output_the_pool_paid_not_the_minimum() public {
+        uint128 surprise = 9e18; // three times the caller's minimum: the pool did better than the quote
+        universalRouter.setOutput(address(token1), surprise);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
+        ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
+        bytes memory signature = _sign(USER_KEY, permit);
+
+        vm.expectEmit(true, true, true, true, address(router));
+        emit ISVRouter.Trade(
+            user, PoolId.unwrap(key.toId()), address(token0), address(token1), AMOUNT_IN, FEE, surprise, false
+        );
+        vm.prank(user);
+        uint256 amountOut = router.swapExactIn(p, permit, signature);
+
+        assertGt(surprise, MIN_OUT, "the premise: the pool paid more than the caller demanded");
+        assertEq(amountOut, surprise, "the measured output is returned, never the minimum");
+        assertEq(token1.balanceOf(user), MINT + surprise, "and it is what the user actually holds");
+    }
+
+    function test_swapExactIn_succeeds_when_the_output_is_exactly_the_minimum() public {
+        universalRouter.setOutput(address(token1), MIN_OUT); // the boundary of `amountOut < amountOutMin`
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
+        ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
+        bytes memory signature = _sign(USER_KEY, permit);
+
+        vm.expectEmit(true, true, true, true, address(router));
+        emit ISVRouter.Trade(
+            user, PoolId.unwrap(key.toId()), address(token0), address(token1), AMOUNT_IN, FEE, MIN_OUT, false
+        );
+        vm.prank(user);
+        uint256 amountOut = router.swapExactIn(p, permit, signature);
+
+        assertEq(amountOut, MIN_OUT, "exactly the minimum is enough");
+        assertEq(token1.balanceOf(user), MINT + MIN_OUT, "output at the user");
+    }
+
     function test_swapExactIn_encodes_one_v4_swap_when_buying() public {
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         p.hookData = hex"c0ffee";
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         // Signed before the prank: reading Permit2's domain separator is an external call, which would
@@ -547,28 +598,36 @@ contract SVRouterTest is SVRouterTestBase {
         assertEq(params.length, 3, "one parameter per action");
 
         // Then every field the mock decoded out of it.
-        _assertRecordedSwap(true, NET, OUTPUT, hex"c0ffee");
+        _assertRecordedSwap(true, NET, MIN_OUT, hex"c0ffee");
     }
 
     function test_swapExactIn_encodes_one_v4_swap_when_selling() public {
         universalRouter.setOutput(address(token0), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(false, AMOUNT_IN, OUTPUT - 1);
+        ISVRouter.SwapParams memory p = _swapParams(false, AMOUNT_IN, MIN_OUT - 1);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token1), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
+        vm.expectEmit(true, true, true, true, address(router));
+        emit ISVRouter.Trade(
+            user, PoolId.unwrap(key.toId()), address(token1), address(token0), AMOUNT_IN, FEE, OUTPUT, false
+        );
         vm.prank(user);
-        router.swapExactIn(p, permit, signature);
+        uint256 amountOut = router.swapExactIn(p, permit, signature);
 
         assertEq(universalRouter.lastCommands(), abi.encodePacked(uint8(Commands.V4_SWAP)), "one V4_SWAP command");
         assertEq(universalRouter.lastDeadline(), p.deadline, "the trade's deadline is forwarded");
-        _assertRecordedSwap(false, NET, OUTPUT - 1, "");
+        _assertRecordedSwap(false, NET, MIN_OUT - 1, "");
+        // The three numbers are all different here: the minimum sent (MIN_OUT - 1), the minimum in the params,
+        // and the output paid. The return value must be the last of them.
+        assertEq(amountOut, OUTPUT, "the measured output, not the minimum in the params");
+        assertEq(token0.balanceOf(user), MINT + OUTPUT, "and that is what the user holds");
     }
 
     function test_swapExactIn_settles_the_whole_input_when_the_fee_is_zero() public {
         nft.mint(user, 1); // holderFeeBps is 0 at deploy, so net == amountIn and nothing is skimmed
-        _trade(true, AMOUNT_IN, OUTPUT, OUTPUT, 0);
+        _trade(true, AMOUNT_IN, MIN_OUT, OUTPUT, 0);
 
-        _assertRecordedSwap(true, AMOUNT_IN, OUTPUT, "");
+        _assertRecordedSwap(true, AMOUNT_IN, MIN_OUT, "");
         assertEq(token0.balanceOf(address(universalRouter)), AMOUNT_IN, "the mock was paid what it must settle");
     }
 
@@ -607,18 +666,19 @@ contract SVRouterTest is SVRouterTestBase {
         token0.mint(address(router), strayIn);
         token1.mint(address(router), strayOut);
 
-        _trade(true, AMOUNT_IN, OUTPUT, OUTPUT, 0);
+        _trade(true, AMOUNT_IN, MIN_OUT, OUTPUT, 0);
 
         assertEq(token0.balanceOf(address(router)), strayIn, "tokenIn balance unchanged by the swap");
         assertEq(token1.balanceOf(address(router)), strayOut, "tokenOut balance unchanged by the swap");
         assertEq(token0.allowance(address(router), address(universalRouter)), 0, "no allowance to the router");
         assertEq(token1.allowance(address(router), address(universalRouter)), 0, "no allowance to the router");
         assertEq(token0.allowance(address(router), permit2), 0, "no allowance to Permit2");
+        assertEq(token1.allowance(address(router), permit2), 0, "no allowance to Permit2");
     }
 
     function test_swapExactIn_succeeds_at_exactly_the_deadline() public {
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -631,7 +691,7 @@ contract SVRouterTest is SVRouterTestBase {
 
     function test_swapExactIn_accepts_a_permit_for_more_than_amountIn() public {
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN * 2, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -650,7 +710,7 @@ contract SVRouterTest is SVRouterTestBase {
     function test_swapExactIn_at_the_holder_rate_of_zero_takes_no_fee_and_transfers_nothing() public {
         nft.mint(user, 1); // holderFeeBps is 0 at deploy: the holder pays nothing
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -687,7 +747,7 @@ contract SVRouterTest is SVRouterTestBase {
         nft.mint(user, 1);
         uint128 holderFee = AMOUNT_IN * 20 / 10_000; // 2e18
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -704,32 +764,45 @@ contract SVRouterTest is SVRouterTestBase {
         assertLt(holderFee, FEE, "the holder paid less than the standard rate");
     }
 
-    function test_swapExactIn_completes_when_the_nft_call_reverts() public {
+    // A wrong or hostile Suits NFT costs the holder rate and nothing else. Four ways for the address to be
+    // wrong, one assertion for all of them: `feeFor` answers at the standard rate and the trade completes.
+
+    function test_a_suits_nft_whose_balanceOf_reverts_costs_the_holder_rate_not_the_trade() public {
+        // Deployed before any prank: a CREATE from this test would consume it.
         RevertingSuitsNft unwell = new RevertingSuitsNft();
-        vm.prank(owner);
-        router.setSuitsNft(address(unwell));
-        universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
-        ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
-        bytes memory signature = _sign(USER_KEY, permit);
-
-        vm.expectEmit(true, true, true, true, address(router));
-        emit ISVRouter.Trade(
-            user, PoolId.unwrap(key.toId()), address(token0), address(token1), AMOUNT_IN, FEE, OUTPUT, false
-        );
-        vm.prank(user);
-        uint256 amountOut = router.swapExactIn(p, permit, signature);
-
-        assertEq(amountOut, OUTPUT, "a broken NFT costs the holder rate, never the trade");
-        assertEq(token0.balanceOf(feeWallet), FEE, "the standard fee was taken");
-        assertEq(token1.balanceOf(user), MINT + OUTPUT, "the output still reached the user");
+        _assertTheNftIsIgnored(address(unwell));
     }
 
-    function test_swapExactIn_completes_when_the_nft_address_has_no_code() public {
+    function test_a_codeless_suits_nft_address_costs_the_holder_rate_not_the_trade() public {
+        address noCode = makeAddr("an address with no code");
+        assertEq(noCode.code.length, 0, "the premise: no code there");
+        _assertTheNftIsIgnored(noCode);
+    }
+
+    function test_a_suits_nft_that_replies_with_short_data_costs_the_holder_rate_not_the_trade() public {
+        // Code, but not an ERC721: `balanceOf` answers with 8 bytes, which is not a word.
+        MockERC721ShortReply short = new MockERC721ShortReply();
+        _assertTheNftIsIgnored(address(short));
+    }
+
+    function test_a_suits_nft_that_burns_its_gas_allowance_costs_the_holder_rate_not_the_trade() public {
+        // The static call is capped, so an NFT that never returns cannot grief the trade.
+        GasBurningSuitsNft greedy = new GasBurningSuitsNft();
+        _assertTheNftIsIgnored(address(greedy));
+    }
+
+    /// @dev `nft` is set as the Suits NFT, then: `feeFor` returns the standard rate without reverting, and a
+    ///      whole trade goes through at that rate, with the exact `Trade` event and the output at the user.
+    function _assertTheNftIsIgnored(address brokenNft) private {
         vm.prank(owner);
-        router.setSuitsNft(makeAddr("an address with no code"));
+        router.setSuitsNft(brokenNft);
+
+        (uint256 quoted, bool quotedHolderRate) = router.feeFor(user, AMOUNT_IN);
+        assertEq(quoted, FEE, "the standard rate, and feeFor itself does not revert");
+        assertFalse(quotedHolderRate, "not a holder");
+
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -740,8 +813,9 @@ contract SVRouterTest is SVRouterTestBase {
         vm.prank(user);
         uint256 amountOut = router.swapExactIn(p, permit, signature);
 
-        assertEq(amountOut, OUTPUT, "a codeless NFT address costs the holder rate, never the trade");
+        assertEq(amountOut, OUTPUT, "a wrong NFT costs the holder rate, never the trade");
         assertEq(token0.balanceOf(feeWallet), FEE, "the standard fee was taken");
+        assertEq(token1.balanceOf(user), MINT + OUTPUT, "the output still reached the user");
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -749,16 +823,15 @@ contract SVRouterTest is SVRouterTestBase {
     // -------------------------------------------------------------------------------------------------------
 
     function test_swapExactIn_reverts_after_the_deadline() public {
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
         vm.warp(p.deadline + 1);
+        _expectNoPermitPull(); // the deadline is checked before anything moves
         vm.expectRevert(ISVRouter.Expired.selector);
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
-
-        assertEq(token0.balanceOf(user), MINT, "nothing was pulled from the user");
     }
 
     function test_swapExactIn_reverts_on_a_zero_amount() public {
@@ -766,53 +839,57 @@ contract SVRouterTest is SVRouterTestBase {
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
+        _expectNoPermitPull(); // the amount is checked before anything moves
         vm.expectRevert(ISVRouter.ZeroAmount.selector);
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
+
+        // The end state after the refusal: the user keeps everything, no fee was taken, and the Universal
+        // Router was never called (the mock records every call it accepts).
+        assertEq(token0.balanceOf(user), MINT, "the user still holds everything");
+        assertEq(token0.balanceOf(feeWallet), 0, "no fee was taken");
+        assertEq(universalRouter.lastCommands().length, 0, "the Universal Router was never called");
     }
 
     function test_swapExactIn_reverts_when_the_permit_names_another_token() public {
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         // The trade pays currency0; the permit is signed for currency1.
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token1), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
+        _expectNoPermitPull(); // the router checks the permit itself before handing it to Permit2
         vm.expectRevert(ISVRouter.PermitMismatch.selector);
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
-
-        assertEq(token1.balanceOf(user), MINT, "nothing was pulled from the user");
     }
 
     function test_swapExactIn_reverts_when_the_permit_covers_less_than_amountIn() public {
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN - 1, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
+        _expectNoPermitPull(); // the router checks the permit itself before handing it to Permit2
         vm.expectRevert(ISVRouter.PermitMismatch.selector);
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
-
-        assertEq(token0.balanceOf(user), MINT, "nothing was pulled from the user");
     }
 
     function test_swapExactIn_reverts_on_a_signature_from_another_key() public {
         universalRouter.setOutput(address(token1), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(STRANGER_KEY, permit); // not the caller's key
 
+        _expectOnePermitPull(); // the router hands it over; the refusal below is Permit2's, not the router's
         vm.expectRevert(SignatureVerification.InvalidSigner.selector); // Permit2's own check
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
-
-        assertEq(token0.balanceOf(user), MINT, "nothing was pulled from the user");
     }
 
     function test_swapExactIn_reverts_when_the_permit_nonce_is_reused() public {
-        _trade(true, AMOUNT_IN, OUTPUT, OUTPUT, 0);
+        _trade(true, AMOUNT_IN, MIN_OUT, OUTPUT, 0);
 
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
@@ -825,35 +902,32 @@ contract SVRouterTest is SVRouterTestBase {
     }
 
     function test_swapExactIn_reverts_when_the_output_is_below_the_minimum() public {
-        uint128 short = OUTPUT - 1; // a hook took a bite out of the output, say
+        uint128 short = MIN_OUT - 1; // a hook took a bite out of the output, say
         universalRouter.setOutput(address(token1), short);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
-        vm.expectRevert(abi.encodeWithSelector(ISVRouter.InsufficientOutput.selector, short, OUTPUT));
+        // The swap is made and only then judged: the router measures what arrived, it does not pre-check.
+        vm.expectCall(address(universalRouter), abi.encodeWithSelector(MockUniversalRouter.execute.selector), 1);
+        vm.expectRevert(abi.encodeWithSelector(ISVRouter.InsufficientOutput.selector, short, MIN_OUT));
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
-
-        assertEq(token0.balanceOf(feeWallet), 0, "the whole trade was rolled back, fee included");
-        assertEq(token0.balanceOf(user), MINT, "nothing was pulled from the user");
     }
 
     function test_swapExactIn_bubbles_up_the_universal_routers_revert() public {
         // What the real Universal Router throws when the pool cannot fill the trade at the caller's minimum.
-        bytes memory slippage = abi.encodeWithSelector(IV4Router.V4TooLittleReceived.selector, OUTPUT, OUTPUT - 1);
+        bytes memory slippage = abi.encodeWithSelector(IV4Router.V4TooLittleReceived.selector, MIN_OUT, MIN_OUT - 1);
         universalRouter.setOutput(address(token1), OUTPUT);
         universalRouter.setRevert(slippage);
-        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(true, AMOUNT_IN, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(token0), AMOUNT_IN, 0);
         bytes memory signature = _sign(USER_KEY, permit);
 
-        vm.expectRevert(slippage);
+        vm.expectCall(address(universalRouter), abi.encodeWithSelector(MockUniversalRouter.execute.selector), 1);
+        vm.expectRevert(slippage); // exactly the router's own revert data, passed through untouched
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
-
-        assertEq(token0.balanceOf(feeWallet), 0, "the whole trade was rolled back, fee included");
-        assertEq(token0.balanceOf(user), MINT, "nothing was pulled from the user");
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -882,7 +956,11 @@ contract SVRouterTest is SVRouterTestBase {
         vm.prank(owner);
         router.sweep(address(token0), address(0), stray);
 
-        assertEq(token0.balanceOf(address(router)), stray, "a sweep can never burn");
+        // Nothing was burned and nothing was locked: the same sweep to a real address still works.
+        address rescue = makeAddr("rescue");
+        vm.prank(owner);
+        router.sweep(address(token0), rescue, stray);
+        assertEq(token0.balanceOf(rescue), stray, "the tokens were still there to sweep");
     }
 
     function test_sweep_is_owner_only() public {
@@ -893,6 +971,9 @@ contract SVRouterTest is SVRouterTestBase {
         vm.prank(stranger);
         router.sweep(address(token0), stranger, stray);
 
-        assertEq(token0.balanceOf(address(router)), stray, "still there");
+        // The owner can still do what the stranger could not.
+        vm.prank(owner);
+        router.sweep(address(token0), stranger, stray);
+        assertEq(token0.balanceOf(stranger), stray, "only the owner moved it");
     }
 }

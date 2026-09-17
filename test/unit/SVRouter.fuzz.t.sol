@@ -101,7 +101,7 @@ contract SVRouterFuzzTest is SVRouterTestBase {
         c.userOutBefore = tokenOut.balanceOf(user);
 
         universalRouter.setOutput(address(tokenOut), OUTPUT);
-        ISVRouter.SwapParams memory p = _swapParams(c.zeroForOne, c.amountIn, OUTPUT);
+        ISVRouter.SwapParams memory p = _swapParams(c.zeroForOne, c.amountIn, MIN_OUT);
         ISignatureTransfer.PermitTransferFrom memory permit = _permitFor(address(tokenIn), c.amountIn, 0);
         // Signed before the prank: reading Permit2's domain separator is an external call, which would
         // otherwise consume it and send the trade from the test contract instead of the user.
@@ -121,7 +121,8 @@ contract SVRouterFuzzTest is SVRouterTestBase {
         uint256 inFeeWallet = tokenIn.balanceOf(feeWallet);
         uint256 inUniversalRouter = tokenIn.balanceOf(address(universalRouter));
 
-        assertEq(c.amountOut, OUTPUT, "returned amountOut");
+        assertEq(c.amountOut, OUTPUT, "the measured output is returned, never the minimum asked for");
+        assertGt(OUTPUT, MIN_OUT, "the premise: the mock pays more than the trade demanded");
         assertEq(inFeeWallet, c.fee, "fee = amountIn * bps / 10_000, in the fee wallet");
         assertEq(inFeeWallet, uint256(c.amountIn) * (c.holdsNft ? c.holderBps : c.bps) / 10_000, "the rate applied");
         assertEq(inUniversalRouter, c.amountIn - c.fee, "net reached the Universal Router");
