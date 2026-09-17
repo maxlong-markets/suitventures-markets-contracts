@@ -125,6 +125,11 @@ contract SVRouterFuzzTest is SVRouterTestBase {
         assertEq(inFeeWallet, c.fee, "fee = amountIn * bps / 10_000, in the fee wallet");
         assertEq(inFeeWallet, uint256(c.amountIn) * (c.holdsNft ? c.holderBps : c.bps) / 10_000, "the rate applied");
         assertEq(inUniversalRouter, c.amountIn - c.fee, "net reached the Universal Router");
+        assertEq(
+            universalRouter.lastSwapParams().settleAmount,
+            c.amountIn - c.fee,
+            "the router settles exactly the net amount, never the open delta"
+        );
         assertEq(inFeeWallet + inUniversalRouter, c.amountIn, "fee + net = amountIn");
         assertLe(inFeeWallet, uint256(c.amountIn) / 200, "the fee never exceeds 0.5 % of the input");
         assertEq(tokenIn.balanceOf(user), c.userInBefore - c.amountIn, "the user paid exactly amountIn");
