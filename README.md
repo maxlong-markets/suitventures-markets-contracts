@@ -8,6 +8,51 @@ the output, and emits one `Trade` event. It never holds a token after a swap and
 - Spec (binding): [`docs/superpowers/specs/2026-09-17-svrouter-design.md`](docs/superpowers/specs/2026-09-17-svrouter-design.md)
 - Plan: [`docs/superpowers/plans/2026-09-17-svrouter.md`](docs/superpowers/plans/2026-09-17-svrouter.md)
 
+## How to review
+
+Read in this order. Times are for a careful pass.
+
+1. **The design (15 min):** `docs/superpowers/specs/2026-09-17-svrouter-design.md`. Sections 3 to 5 are the requirements; 6a lists the implementation choices made during the build; 7 lists the accepted risks, three of which are decisions for you (below).
+2. **The contract (45 min):** `src/SVRouter.sol`, top to bottom, against the spec rule each line implements.
+
+   | Spec rule | Where |
+   |---|---|
+   | The fee can never exceed 0.5 %; deploy values 50 and 0 | `MAX_FEE_BPS` line 41, constructor lines 88 to 102, `setFees` bounds line 209 |
+   | Universal Router and Permit2 are fixed at deploy | immutables lines 55 and 58; the deploy script refuses any address but the spec's unless told otherwise |
+   | Checks before any funds move: deadline, non-zero amount, permit matches the input token and amount | lines 128, 129, 135 |
+   | Permit2 pulls exactly `amountIn` into the router | line 138 |
+   | Fee on the input, rounded down, holder rate when a Suits NFT is held; a bad NFT address can never block a trade | `feeFor` lines 182 to 189, static call with a 100,000 gas allowance at line 185 |
+   | Fee to the fee wallet, net to the Universal Router, no allowance ever granted | lines 151 to 153 |
+   | One Universal Router call: exact-input single swap, settle the exact net, take to the user | `_executeSwap` lines 263 to 290, action bytes from the libraries at line 270 |
+   | Output measured as the user's balance delta; below the minimum reverts | lines 157 to 163 |
+   | One `Trade` event with gross input, fee, output and the rate used | line 166 |
+   | Owner can change the wallet, lower or raise the fee within the cap, set the NFT, sweep a stray token; never renounce | lines 199 to 238 |
+   | Reentrancy | `nonReentrant` on `swapExactIn` line 122 |
+
+3. **What the unit suite proves (30 min):** `test/unit/SVRouter.t.sol` is grouped by concern (constructor, setters, ownership, `feeFor`, trades in both directions, every revert, holder rates, the four wrong-NFT cases, `sweep`); `SVRouter.fuzz.t.sol` fuzzes the fee arithmetic and a full trade; `SVRouter.smoke.t.sol` is the harness demonstration. The mock router (`test/mocks/MockUniversalRouter.sol`) decodes the real command and action encodings and records every field, so an encoding regression fails a named test.
+4. **What the fork suite proves (15 min):** `test/fork/SVRouterFork.t.sol` runs the real Permit2, the real Universal Router and the three real pools at a pinned block: buys and sells on a Pons pool in both currency orders, a dust buy on the LONG AI/NVDA pool, a holder paying no fee, the two revert paths, and an oversized swap reverting with nothing left in the Universal Router. The V4 Quoter and the router agree to the wei on every trade.
+5. **Coverage:** `docs/review/2026-09-17-coverage.md`, produced by an independent run.
+
+**Decisions that are yours:**
+
+- D34 as written gives a Suits NFT holder 0 % with a spot balance check, so an NFT borrowed for one transaction pays no fee. Keep at 0 %, or set a smaller discount with `setFees` after deploy.
+- `sweep` (line 229) exists for tokens sent to the router by mistake. Strike it if you would rather the router had no owner-controlled transfer at all.
+- Exact input only: the app quotes exact-output requests with the Quoter and executes exact input. Confirm that is acceptable for M2.
+- The static call's 100,000 gas allowance (line 48): generous for any ERC721, including proxied ones; a hostile NFT set by the owner is the only thing it guards against.
+
+**Run it yourself:**
+
+```
+forge build --sizes
+forge test                                   # unit suite; the fork file reports skipped
+forge coverage --report summary              # src/SVRouter.sol must read 100 % on all four columns
+ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-path 'test/fork/*' -vv
+```
+
+The public RPC keeps about 50,000 blocks of state, so if the pinned block has aged out, add `ROBINHOOD_FORK_BLOCK=<a recent block>`; the failure is loud, never silent.
+
+**Not done on purpose:** no deployment, no Blockscout verification, no GitHub remote, no frontend wiring. All of that starts after your review.
+
 ## Layout
 
 | Path | What it is |
