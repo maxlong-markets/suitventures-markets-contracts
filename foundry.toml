@@ -1,0 +1,37 @@
+# SVRouter: Foundry configuration.
+# Solidity 0.8.26 on the Cancun EVM, which is what Robinhood Chain (chain id 4663) runs
+# and what Uniswap v4 core needs (transient storage).
+
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 1_000_000
+via_ir = false
+# No file-system access for tests or scripts: nothing here reads or writes files.
+fs_permissions = []
+# Only remappings.txt applies; the nested lib/ trees of the dependencies are ignored so that
+# every import of a Uniswap type resolves to exactly one copy (the pinned root submodule).
+auto_detect_remappings = false
+
+[rpc_endpoints]
+robinhood = "${ROBINHOOD_RPC_URL}"
+
+# forge fmt defaults, written out so a reviewer sees the exact style the gate enforces.
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+multiline_func_header = "attributes_first"
+quote_style = "double"
+number_underscore = "preserve"
+single_line_statement_blocks = "preserve"
+override_spacing = false
+wrap_comments = false
+ignore = []
