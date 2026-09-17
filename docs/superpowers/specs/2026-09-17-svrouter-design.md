@@ -89,6 +89,7 @@ Sell-side fees arrive in the token being sold (the README's Fees table says so);
 - A zero fee (holder rate 0 bps) is not transferred at all; the fee wallet sees no zero-value transfer.
 - The constructor emits `FeeWalletChanged`, `FeesChanged` and `SuitsNftChanged` with the initial values, so indexers see the deploy state.
 - The Universal Router call lives in an internal `_executeSwap` (stack depth without via-IR).
+- The Suits NFT check is a low-level static call with a fixed 100,000 gas allowance: a holder needs a successful 32-byte reply above zero; a codeless address, a revert, a malformed reply or a call that exhausts its allowance all mean the normal rate, and the allowance keeps a hostile NFT from burning the transaction's gas.
 - Dependencies pinned: universal-router 2.1.1, v4-periphery 3231810e, permit2 cc56ad0f, OpenZeppelin 5.7.0; unit tests etch Permit2's real bytecode at its canonical address (its sources pin solc 0.8.17).
 
 ## 7. Risks and open items
