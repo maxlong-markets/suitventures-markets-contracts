@@ -43,6 +43,10 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     /// @dev Basis points denominator: 10_000 bps is 100 %.
     uint256 private constant BPS = 10_000;
 
+    /// @dev Gas allowance for reading the Suits NFT balance. An ERC721 `balanceOf` costs a few thousand gas even
+    ///      behind a proxy; the allowance bounds what a misbehaving NFT contract can burn of a trade's gas.
+    uint256 private constant HOLDER_CHECK_GAS = 100_000;
+
     // -------------------------------------------------------------------------------------------------------
     // Immutables: the two contracts this router talks to, fixed at deploy
     // -------------------------------------------------------------------------------------------------------
@@ -169,17 +173,18 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     /// @inheritdoc ISVRouter
     /// @dev The single fee rule, used by `swapExactIn` and readable by the app for its quote. The holder rate
     ///      applies when an NFT is configured and the user holds at least one. Rounds down.
-    ///      The NFT must never be able to stop a trade, only to grant the holder rate: an address without code
-    ///      is skipped (a call to it returns no data, and decoding that would revert here, outside the reach of
-    ///      try/catch), and a `balanceOf` that reverts is caught. Both cases mean "not a holder".
+    ///      The NFT must never be able to stop a trade, only to grant the holder rate, so its `balanceOf` is
+    ///      read with a raw static call and the user counts as a holder only when the call succeeds, the reply
+    ///      is exactly one 32-byte word and that word is above zero. Anything else, an address without code, a
+    ///      revert, a reply of another length, a callee that runs out of its gas allowance, means the normal
+    ///      rate and the trade goes on. A high-level call would not do: decoding a missing or short reply
+    ///      reverts in this contract, outside the reach of try/catch.
     function feeFor(address user, uint256 amountIn) public view returns (uint256 fee, bool holderRate) {
         address nft = suitsNft;
-        if (nft != address(0) && nft.code.length != 0) {
-            try IERC721(nft).balanceOf(user) returns (uint256 balance) {
-                holderRate = balance > 0;
-            } catch {
-                holderRate = false;
-            }
+        if (nft != address(0)) {
+            (bool ok, bytes memory reply) =
+                nft.staticcall{gas: HOLDER_CHECK_GAS}(abi.encodeCall(IERC721.balanceOf, (user)));
+            holderRate = ok && reply.length == 32 && abi.decode(reply, (uint256)) > 0;
         }
         uint256 bps = holderRate ? holderFeeBps : feeBps;
         fee = amountIn * bps / BPS;
@@ -209,8 +214,10 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
 
     /// @inheritdoc ISVRouter
     /// @dev The Suits NFT address is not known yet (spec section 2); zero keeps the perk off. Any address is
-    ///      accepted: `feeFor` treats an address without code, or with a reverting `balanceOf`, as "no holder",
-    ///      so a wrong address costs the holder rate, never a trade.
+    ///      accepted: `feeFor` reads its `balanceOf` with a static call and counts a holder only on a successful
+    ///      one-word reply above zero; an address without code, a revert, a reply of another length or a callee
+    ///      that exhausts its gas allowance all mean the normal rate, so a wrong address can cost the holder
+    ///      rate but never a trade.
     function setSuitsNft(address nft) external onlyOwner {
         suitsNft = nft;
         emit SuitsNftChanged(nft);

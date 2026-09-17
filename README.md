@@ -47,7 +47,7 @@ Copy `.env.example` to `.env` (git-ignored). Placeholders only in the example; n
 | `OWNER` | deploy script | `Ownable2Step` owner: Kobe's EOA at deploy, MAXLONG's Safe once it accepts at M5 |
 | `FEE_WALLET` | deploy script | receives the router fee |
 | `SUITS_NFT` | deploy script | the Suits NFT; zero or unset disables the holder perk (address TBD) |
-| `UNIVERSAL_ROUTER` | deploy script | `0x06afBA43fd06227fA663b0dAeCF536F6eaA6BF99`, the current Universal Router (D38) |
+| `UNIVERSAL_ROUTER` | deploy script | `0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99`, the current Universal Router (D38) |
 | `PERMIT2` | deploy script | `0x000000000022D473030F116dDEE9F6B43aC78BA3`, the canonical Permit2 |
 | `ALLOW_OTHER_ADDRESSES` | deploy script | `true` lets the script deploy against a router or Permit2 other than the two constants above; unset otherwise |
 
@@ -88,7 +88,7 @@ The command byte and the action bytes are the constants of the installed `univer
 `v4-periphery` (`Actions.sol`, `ActionConstants.sol`) libraries; nothing is hand-written.
 
 The dependency versions were chosen against the chain, not the calendar. The Universal Router deployed at
-`0x06afBA43fd06227fA663b0dAeCF536F6eaA6BF99` was fingerprinted on 17 Sep 2026 (block 65,188,720):
+`0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99` was fingerprinted on 17 Sep 2026 (block 65,188,720):
 
 - its bytecode contains the selectors of `executeSigned`, `signedRouteContext` (added in universal-router 2.1.1)
   and of `V4TooLittleReceivedPerHop`, `V4TooLittleReceivedPerHopSingle`, `InvalidHopPriceLength` (added to

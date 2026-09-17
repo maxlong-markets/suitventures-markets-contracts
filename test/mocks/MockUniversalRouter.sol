@@ -50,6 +50,7 @@ contract MockUniversalRouter {
     error BadInputs(uint256 count);
     error BadActions(bytes actions);
     error BadMinHopPrice(uint256 minHopPriceX36);
+    error SettleAmountZero();
     error BadSettle(address currency, uint256 amount, bool payerIsUser);
     error BadTake(address currency, address recipient, uint256 amount);
     error WrongAmountIn(uint256 expected, uint256 received);
@@ -152,6 +153,9 @@ contract MockUniversalRouter {
         if (s.minHopPriceX36 != 0) revert BadMinHopPrice(s.minHopPriceX36);
 
         // SETTLE: the input currency, exactly the net amount (not the open delta), paid by the router itself.
+        // Zero gets its own error: the real router reads a zero settle amount as OPEN_DELTA, the whole open
+        // debt, which is the encoding the security review rejected.
+        if (s.settleAmount == 0) revert SettleAmountZero();
         if (s.settleCurrency != tokenIn || s.settleAmount != s.amountIn || s.settlePayerIsUser) {
             revert BadSettle(s.settleCurrency, s.settleAmount, s.settlePayerIsUser);
         }
