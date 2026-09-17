@@ -49,6 +49,7 @@ Copy `.env.example` to `.env` (git-ignored). Placeholders only in the example; n
 | `SUITS_NFT` | deploy script | the Suits NFT; zero or unset disables the holder perk (address TBD) |
 | `UNIVERSAL_ROUTER` | deploy script | `0x06afBA43fd06227fA663b0dAeCF536F6eaA6BF99`, the current Universal Router (D38) |
 | `PERMIT2` | deploy script | `0x000000000022D473030F116dDEE9F6B43aC78BA3`, the canonical Permit2 |
+| `ALLOW_OTHER_ADDRESSES` | deploy script | `true` lets the script deploy against a router or Permit2 other than the two constants above; unset otherwise |
 
 The deployer key is never an environment variable: pass it to forge with `--account`, `--ledger` or
 `--interactive`.
@@ -59,6 +60,9 @@ The deployer key is never an environment variable: pass it to forge with `--acco
 forge script script/Deploy.s.sol --rpc-url robinhood --account <keystore name> --broadcast \
   --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
 ```
+
+The script refuses to run unless `block.chainid == 4663`, and unless `UNIVERSAL_ROUTER` and `PERMIT2` are the
+spec's constants; set `ALLOW_OTHER_ADDRESSES=true` to deploy against other addresses on purpose.
 
 To verify an already deployed address on Blockscout:
 
@@ -77,7 +81,7 @@ forge verify-contract <address> src/SVRouter.sol:SVRouter --chain-id 4663 \
 | Action | Params | Meaning |
 |---|---|---|
 | `SWAP_EXACT_IN_SINGLE` | `IV4Router.ExactInputSingleParams{poolKey, zeroForOne, amountIn = amountIn - fee, amountOutMinimum = amountOutMin, minHopPriceX36 = 0, hookData}` | the swap; `minHopPriceX36 = 0` switches the router's optional per-hop price floor off, `amountOutMin` is the bound |
-| `SETTLE` | `(currencyIn, OPEN_DELTA, payerIsUser = false)` | pay the whole input debt from the tokens the Universal Router already holds, which the router sent it |
+| `SETTLE` | `(currencyIn, net, payerIsUser = false)` | pay exactly the net amount from the tokens the Universal Router already holds, which the router sent it; if the pool consumed less (a partial fill), the PoolManager rejects the unlock and the whole call reverts, so no input is ever left inside the Universal Router |
 | `TAKE` | `(currencyOut, user, OPEN_DELTA)` | send the whole output credit straight to the user |
 
 The command byte and the action bytes are the constants of the installed `universal-router` (`Commands.sol`) and

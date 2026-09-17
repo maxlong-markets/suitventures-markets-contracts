@@ -27,7 +27,9 @@ import {ISVRouter} from "./interfaces/ISVRouter.sol";
 ///
 ///      Out of scope on purpose: native ETH on either side of a pool (every listed quote asset is an ERC20),
 ///      exact-output swaps, multi-hop routes, a pause switch. A key that names the zero currency fails safely:
-///      SafeERC20 refuses to transfer through an address without code.
+///      SafeERC20 refuses to transfer through an address without code. Fee-on-transfer and rebasing input
+///      tokens are unsupported and fail closed: the router would receive less than `amountIn`, could not fund
+///      the fee and the exact settle, and the call reverts.
 contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -105,10 +107,10 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     ///      1. deadline and amount checks, before anything moves;
     ///      2. the permit must name the input token and cover `amountIn`, then Permit2 pulls exactly `amountIn`
     ///         into this contract (Permit2 enforces the signature, the nonce and the permit's own deadline);
-    ///      3. the fee is split off and sent to the fee wallet, the rest is sent to the Universal Router, which
-    ///         will pay the pool from its own balance;
-    ///      4. one Universal Router call, built and made by `_executeSwap`: swap exact input, settle the input,
-    ///         take the output to the user;
+    ///      3. the fee is split off and sent to the fee wallet, the rest (`net`) is sent to the Universal Router,
+    ///         which will pay the pool from its own balance;
+    ///      4. one Universal Router call, built and made by `_executeSwap`: swap exact input, settle exactly
+    ///         `net`, take the output to the user;
     ///      5. `amountOut` is the user's balance difference, so a hook fee taken from the output is counted, and
     ///         the minimum is enforced here as well as inside the Universal Router;
     ///      6. emit `Trade`.
@@ -134,9 +136,11 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
             signature
         );
 
-        // 3. Fee first, in the input token. The rest is the swap's input. The fee is at most 0.5 % of amountIn,
-        //    so `net` can never underflow and is never zero. A zero fee (holder rate at 0 bps, or a tiny
-        //    amountIn that rounds to 0) is not transferred at all: some tokens revert on zero-value transfers.
+        // 3. Fee first, in the input token. The rest, `net`, is the swap's input and the exact amount the
+        //    Universal Router will settle. The fee is at most 0.5 % of amountIn, so `net` can never underflow
+        //    and is never zero (zero would mean "the open delta" to SETTLE). A zero fee (holder rate at 0 bps,
+        //    or a tiny amountIn that rounds to 0) is not transferred at all: some tokens revert on zero-value
+        //    transfers.
         (uint256 fee, bool holderRate) = feeFor(msg.sender, p.amountIn);
         // The cast cannot truncate: fee <= amountIn / 200 and amountIn is a uint128.
         // forge-lint: disable-next-line(unsafe-typecast)
@@ -165,9 +169,18 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     /// @inheritdoc ISVRouter
     /// @dev The single fee rule, used by `swapExactIn` and readable by the app for its quote. The holder rate
     ///      applies when an NFT is configured and the user holds at least one. Rounds down.
+    ///      The NFT must never be able to stop a trade, only to grant the holder rate: an address without code
+    ///      is skipped (a call to it returns no data, and decoding that would revert here, outside the reach of
+    ///      try/catch), and a `balanceOf` that reverts is caught. Both cases mean "not a holder".
     function feeFor(address user, uint256 amountIn) public view returns (uint256 fee, bool holderRate) {
         address nft = suitsNft;
-        holderRate = nft != address(0) && IERC721(nft).balanceOf(user) > 0;
+        if (nft != address(0) && nft.code.length != 0) {
+            try IERC721(nft).balanceOf(user) returns (uint256 balance) {
+                holderRate = balance > 0;
+            } catch {
+                holderRate = false;
+            }
+        }
         uint256 bps = holderRate ? holderFeeBps : feeBps;
         fee = amountIn * bps / BPS;
     }
@@ -195,17 +208,27 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     }
 
     /// @inheritdoc ISVRouter
-    /// @dev The Suits NFT address is not known yet (spec section 2); zero keeps the perk off. An address without
-    ///      code would make every swap revert at `balanceOf`, which the owner can correct with another call.
+    /// @dev The Suits NFT address is not known yet (spec section 2); zero keeps the perk off. Any address is
+    ///      accepted: `feeFor` treats an address without code, or with a reverting `balanceOf`, as "no holder",
+    ///      so a wrong address costs the holder rate, never a trade.
     function setSuitsNft(address nft) external onlyOwner {
         suitsNft = nft;
         emit SuitsNftChanged(nft);
     }
 
     /// @inheritdoc ISVRouter
-    /// @dev The router's balances are unchanged by a swap, so anything here arrived by mistake.
+    /// @dev The router's balances are unchanged by a swap, so anything here arrived by mistake. Zero is refused
+    ///      as the recipient so a sweep can never burn.
     function sweep(address token, address to, uint256 amount) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
         IERC20(token).safeTransfer(to, amount);
+        emit Swept(token, to, amount);
+    }
+
+    /// @notice Disabled: a router with no owner could never change its fee wallet or its fees again.
+    /// @dev Overrides OpenZeppelin's `renounceOwnership`, which would otherwise leave the contract ownerless.
+    function renounceOwnership() public pure override {
+        revert RenounceDisabled();
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -220,8 +243,13 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
     ///        SWAP_EXACT_IN_SINGLE: swap `net` of currencyIn for at least `amountOutMin` of currencyOut in the
     ///                              pool of `p.key`, passing `hookData` through. `minHopPriceX36 = 0` switches
     ///                              the router's optional per-hop price floor off; `amountOutMin` is the bound.
-    ///        SETTLE:               pay the swap's whole input debt (OPEN_DELTA) from the tokens the Universal
-    ///                              Router already holds (payerIsUser = false), which this contract sent it.
+    ///        SETTLE:               pay exactly `net` of currencyIn from the tokens the Universal Router already
+    ///                              holds (payerIsUser = false), which this contract sent it. Exactly `net`, not
+    ///                              the open delta: if the pool consumed less (liquidity exhausted at the price
+    ///                              limit, or a hook delta), settling `net` leaves a positive delta and the
+    ///                              PoolManager rejects the unlock with CurrencyNotSettled, so a partial fill
+    ///                              reverts instead of stranding the remainder inside the Universal Router,
+    ///                              where anyone could sweep it.
     ///        TAKE:                 send the swap's whole output credit (OPEN_DELTA) to `recipient`, the user.
     ///      The call itself lives here rather than in `swapExactIn` only to keep that function's live variables
     ///      within what the legacy code generator allows (via-IR is off by design).
@@ -245,7 +273,7 @@ contract SVRouter is ISVRouter, Ownable2Step, ReentrancyGuard {
                 hookData: p.hookData
             })
         );
-        params[1] = abi.encode(currencyIn, ActionConstants.OPEN_DELTA, false);
+        params[1] = abi.encode(currencyIn, uint256(net), false);
         params[2] = abi.encode(currencyOut, recipient, ActionConstants.OPEN_DELTA);
 
         bytes[] memory inputs = new bytes[](1);

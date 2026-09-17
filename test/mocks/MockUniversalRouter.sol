@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {ActionConstants} from "@uniswap/v4-periphery/src/libraries/ActionConstants.sol";
@@ -10,10 +11,13 @@ import {Commands} from "@uniswap/universal-router/contracts/libraries/Commands.s
 import {MockERC20} from "./MockERC20.sol";
 
 /// @notice Offline stand-in for the Universal Router's V4_SWAP path. Unit tests only.
-/// @dev It decodes `execute` calldata exactly the way the real router does (one V4_SWAP command whose input is
-///      `abi.encode(actions, params)`), checks that the actions are SWAP_EXACT_IN_SINGLE, SETTLE, TAKE with the
-///      settle and take parameters SVRouter must produce, checks that the caller transferred exactly the swap's
-///      `amountIn` of the input token to it beforehand (as SVRouter does), and pays the recipient named in TAKE
+/// @dev It decodes `execute` calldata the way the real router does (one V4_SWAP command whose input is
+///      `abi.encode(actions, params)`), records every decoded field in `lastSwapParams()`, and reverts unless the
+///      encoding is the one SVRouter must produce: actions SWAP_EXACT_IN_SINGLE, SETTLE, TAKE in that order;
+///      `minHopPriceX36 == 0`; SETTLE of the input currency for exactly the swap's `amountIn` (the net amount)
+///      with `payerIsUser == false`; TAKE of the output currency for OPEN_DELTA to the user, a third party that
+///      is neither zero, nor the caller, nor this contract. It then checks that the caller transferred exactly
+///      the swap's `amountIn` of the input token to it beforehand, as SVRouter does, and pays the TAKE recipient
 ///      by minting the configured output. It keeps the input it received, so a test can assert "net in the mock
 ///      router"; `settled(token)` is the running total, which lets several swaps run against one instance.
 ///
@@ -21,10 +25,31 @@ import {MockERC20} from "./MockERC20.sol";
 ///      `InsufficientOutput` check reachable. Use `setRevert` to simulate the real router's revert instead.
 ///      `setOutput` and `setRevert` are sticky: they apply to every following call until changed; clear a revert
 ///      with empty data.
+///
+///      Warning: the `received` accounting (`balanceOf(this) - settled[tokenIn]`) assumes that the configured
+///      output token is not the input token and that nothing transfers the input token to this contract outside
+///      a swap. Either would make a later call see a wrong `received` amount.
 contract MockUniversalRouter {
+    /// @notice Every field of the last accepted swap, as decoded from the calldata.
+    struct RecordedSwap {
+        PoolKey key;
+        bool zeroForOne;
+        uint128 amountIn;
+        uint128 amountOutMinimum;
+        uint256 minHopPriceX36;
+        bytes hookData;
+        address settleCurrency;
+        uint256 settleAmount;
+        bool settlePayerIsUser;
+        address takeCurrency;
+        address takeRecipient;
+        uint256 takeAmount;
+    }
+
     error BadCommands(bytes commands);
     error BadInputs(uint256 count);
     error BadActions(bytes actions);
+    error BadMinHopPrice(uint256 minHopPriceX36);
     error BadSettle(address currency, uint256 amount, bool payerIsUser);
     error BadTake(address currency, address recipient, uint256 amount);
     error WrongAmountIn(uint256 expected, uint256 received);
@@ -32,17 +57,18 @@ contract MockUniversalRouter {
 
     address private immutable POOL_MANAGER;
 
-    /// @notice What the next `execute` pays the TAKE recipient: this token, this amount.
+    /// @notice What `execute` pays the TAKE recipient: this token, this amount.
     address public outputToken;
     uint256 public outputAmount;
 
     /// @notice When non-empty, `execute` reverts with exactly this data.
     bytes public revertData;
 
-    /// @notice The last successful `execute` call, as received.
+    /// @notice The last accepted `execute` call, as received.
     bytes public lastCommands;
     bytes[] private _lastInputs;
     uint256 public lastDeadline;
+    RecordedSwap private _lastSwapParams;
 
     /// @notice Input token amounts consumed by previous swaps, per token.
     mapping(address token => uint256 amount) public settled;
@@ -69,6 +95,10 @@ contract MockUniversalRouter {
         return _lastInputs;
     }
 
+    function lastSwapParams() external view returns (RecordedSwap memory) {
+        return _lastSwapParams;
+    }
+
     /// @notice Same signature as `IUniversalRouter.execute`.
     function execute(bytes calldata commands, bytes[] calldata inputs, uint256 deadline) external {
         if (revertData.length != 0) {
@@ -89,42 +119,66 @@ contract MockUniversalRouter {
         if (commands.length != 1 || uint8(commands[0]) != Commands.V4_SWAP) revert BadCommands(commands);
         if (inputs.length != 1) revert BadInputs(inputs.length);
 
-        // The input is abi.encode(actions, params): three actions in this order.
-        (bytes memory actions, bytes[] memory params) = abi.decode(inputs[0], (bytes, bytes[]));
+        RecordedSwap memory s = _decode(inputs[0]);
+        _lastSwapParams = s;
+        _check(s);
+        _settleAndPay(s);
+    }
+
+    /// @dev The input is abi.encode(actions, params): three actions in this order, each with its params.
+    function _decode(bytes calldata input) private pure returns (RecordedSwap memory s) {
+        (bytes memory actions, bytes[] memory params) = abi.decode(input, (bytes, bytes[]));
         if (
             actions.length != 3 || params.length != 3 || uint8(actions[0]) != Actions.SWAP_EXACT_IN_SINGLE
                 || uint8(actions[1]) != Actions.SETTLE || uint8(actions[2]) != Actions.TAKE
         ) revert BadActions(actions);
 
-        // SWAP_EXACT_IN_SINGLE: the pool and the direction give the two tokens.
         IV4Router.ExactInputSingleParams memory swap = abi.decode(params[0], (IV4Router.ExactInputSingleParams));
-        (address tokenIn, address tokenOut) = swap.zeroForOne
-            ? (Currency.unwrap(swap.poolKey.currency0), Currency.unwrap(swap.poolKey.currency1))
-            : (Currency.unwrap(swap.poolKey.currency1), Currency.unwrap(swap.poolKey.currency0));
+        s.key = swap.poolKey;
+        s.zeroForOne = swap.zeroForOne;
+        s.amountIn = swap.amountIn;
+        s.amountOutMinimum = swap.amountOutMinimum;
+        s.minHopPriceX36 = swap.minHopPriceX36;
+        s.hookData = swap.hookData;
+        (s.settleCurrency, s.settleAmount, s.settlePayerIsUser) = abi.decode(params[1], (address, uint256, bool));
+        (s.takeCurrency, s.takeRecipient, s.takeAmount) = abi.decode(params[2], (address, address, uint256));
+    }
 
-        // SETTLE: the input currency, the open delta, paid by the router itself (not by the caller).
-        (address settleCurrency, uint256 settleAmount, bool payerIsUser) =
-            abi.decode(params[1], (address, uint256, bool));
-        if (settleCurrency != tokenIn || settleAmount != ActionConstants.OPEN_DELTA || payerIsUser) {
-            revert BadSettle(settleCurrency, settleAmount, payerIsUser);
+    /// @dev The fields that carry the user's protection must be exactly what SVRouter is specified to send.
+    function _check(RecordedSwap memory s) private view {
+        (address tokenIn, address tokenOut) = _tokens(s);
+
+        // SWAP_EXACT_IN_SINGLE: the per-hop price floor is off; amountOutMinimum is the user's bound.
+        if (s.minHopPriceX36 != 0) revert BadMinHopPrice(s.minHopPriceX36);
+
+        // SETTLE: the input currency, exactly the net amount (not the open delta), paid by the router itself.
+        if (s.settleCurrency != tokenIn || s.settleAmount != s.amountIn || s.settlePayerIsUser) {
+            revert BadSettle(s.settleCurrency, s.settleAmount, s.settlePayerIsUser);
         }
 
-        // TAKE: the output currency, the open delta, to a real third party (the user), never to the caller
-        // or to this contract.
-        (address takeCurrency, address recipient, uint256 takeAmount) =
-            abi.decode(params[2], (address, address, uint256));
+        // TAKE: the output currency, the open delta, to the user: a third party, never the caller or this mock.
         if (
-            takeCurrency != tokenOut || takeAmount != ActionConstants.OPEN_DELTA || recipient == address(0)
-                || recipient == msg.sender || recipient == address(this)
-        ) revert BadTake(takeCurrency, recipient, takeAmount);
+            s.takeCurrency != tokenOut || s.takeAmount != ActionConstants.OPEN_DELTA || s.takeRecipient == address(0)
+                || s.takeRecipient == msg.sender || s.takeRecipient == address(this)
+        ) revert BadTake(s.takeCurrency, s.takeRecipient, s.takeAmount);
+    }
 
-        // Settle: the caller must have sent exactly the swap's amountIn of the input token before calling.
+    /// @dev Settle: the caller must have sent exactly the swap's amountIn of the input token before calling.
+    ///      Take: pay the configured output to the recipient.
+    function _settleAndPay(RecordedSwap memory s) private {
+        (address tokenIn, address tokenOut) = _tokens(s);
+
         uint256 received = IERC20(tokenIn).balanceOf(address(this)) - settled[tokenIn];
-        if (received != swap.amountIn) revert WrongAmountIn(swap.amountIn, received);
+        if (received != s.amountIn) revert WrongAmountIn(s.amountIn, received);
         settled[tokenIn] += received;
 
-        // Take: pay the configured output to the recipient.
         if (tokenOut != outputToken) revert OutputNotConfigured(tokenOut, outputToken);
-        MockERC20(tokenOut).mint(recipient, outputAmount);
+        MockERC20(tokenOut).mint(s.takeRecipient, outputAmount);
+    }
+
+    function _tokens(RecordedSwap memory s) private pure returns (address tokenIn, address tokenOut) {
+        (tokenIn, tokenOut) = s.zeroForOne
+            ? (Currency.unwrap(s.key.currency0), Currency.unwrap(s.key.currency1))
+            : (Currency.unwrap(s.key.currency1), Currency.unwrap(s.key.currency0));
     }
 }

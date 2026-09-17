@@ -10,7 +10,14 @@ import {SVRouter} from "../src/SVRouter.sol";
 ///
 ///        forge script script/Deploy.s.sol --rpc-url robinhood --account <name> --broadcast \
 ///          --verify --verifier blockscout --verifier-url https://robinhoodchain.blockscout.com/api
+///
+///      The script refuses any chain but Robinhood Chain, and any router or Permit2 address but the spec's
+///      constants unless ALLOW_OTHER_ADDRESSES=true is set on purpose.
 contract Deploy is Script {
+    uint256 internal constant ROBINHOOD_CHAIN_ID = 4663;
+    address internal constant ROBINHOOD_UNIVERSAL_ROUTER = 0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99;
+    address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
     function run() external returns (SVRouter router) {
         address owner = vm.envAddress("OWNER");
         address feeWallet = vm.envAddress("FEE_WALLET");
@@ -18,7 +25,17 @@ contract Deploy is Script {
         address permit2 = vm.envAddress("PERMIT2");
         address suitsNft = vm.envOr("SUITS_NFT", address(0));
 
-        // The two counterparties must exist on the target chain; this also catches a wrong --rpc-url.
+        require(block.chainid == ROBINHOOD_CHAIN_ID, "not Robinhood Chain (chain id 4663): check --rpc-url");
+        if (!vm.envOr("ALLOW_OTHER_ADDRESSES", false)) {
+            require(
+                universalRouter == ROBINHOOD_UNIVERSAL_ROUTER,
+                "UNIVERSAL_ROUTER is not the spec's router; set ALLOW_OTHER_ADDRESSES=true to override"
+            );
+            require(
+                permit2 == CANONICAL_PERMIT2, "PERMIT2 is not the canonical Permit2; set ALLOW_OTHER_ADDRESSES=true"
+            );
+        }
+        // The two counterparties must exist on the target chain.
         require(universalRouter.code.length != 0, "UNIVERSAL_ROUTER has no code on this chain");
         require(permit2.code.length != 0, "PERMIT2 has no code on this chain");
 

@@ -49,6 +49,9 @@ interface ISVRouter {
     /// @notice The Suits NFT address was set; zero means no holder perk (also emitted once at deploy).
     event SuitsNftChanged(address indexed nft);
 
+    /// @notice The owner moved tokens that had been sent to the router by mistake.
+    event Swept(address indexed token, address indexed to, uint256 amount);
+
     /// @notice `block.timestamp` is past the trade's deadline.
     error Expired();
     /// @notice `amountIn` is zero.
@@ -61,6 +64,8 @@ interface ISVRouter {
     error FeeTooHigh();
     /// @notice The user received less than `amountOutMin`.
     error InsufficientOutput(uint256 received, uint256 minimum);
+    /// @notice `renounceOwnership` is disabled: the router must always have an owner.
+    error RenounceDisabled();
 
     /// @notice Trade `p.amountIn` of the input token for as much output as the pool gives, at least
     ///         `p.amountOutMin`, with the output sent straight to the caller.
@@ -84,7 +89,8 @@ interface ISVRouter {
     /// @notice Owner only. Sets the Suits NFT whose holders pay `holderFeeBps`; zero disables the perk.
     function setSuitsNft(address nft) external;
 
-    /// @notice Owner only. Moves tokens sent to the router by mistake; the router holds nothing by design.
+    /// @notice Owner only. Moves tokens sent to the router by mistake (the router holds nothing by design);
+    ///         `to` must be non-zero; emits `Swept`.
     function sweep(address token, address to, uint256 amount) external;
 
     /// @notice The wallet that receives the fee.
