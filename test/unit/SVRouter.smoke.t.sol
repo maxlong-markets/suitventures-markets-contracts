@@ -8,6 +8,7 @@ import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {ActionConstants} from "@uniswap/v4-periphery/src/libraries/ActionConstants.sol";
 import {Commands} from "@uniswap/universal-router/contracts/libraries/Commands.sol";
 import {SVRouter} from "../../src/SVRouter.sol";
 import {ISVRouter} from "../../src/interfaces/ISVRouter.sol";
@@ -15,6 +16,13 @@ import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockERC721} from "../mocks/MockERC721.sol";
 import {MockUniversalRouter} from "../mocks/MockUniversalRouter.sol";
 import {Permit2Signer} from "../utils/Permit2Signer.sol";
+
+/// @dev A Suits NFT whose `balanceOf` reverts, to show the router treats it as "no holder".
+contract RevertingNFT {
+    function balanceOf(address) external pure returns (uint256) {
+        revert("RevertingNFT");
+    }
+}
 
 /// @notice Smoke test: the router deploys with the spec's defaults and completes one buy through the mock router.
 ///         The full unit suite lives in SVRouter.t.sol and SVRouter.fuzz.t.sol.
@@ -79,21 +87,8 @@ contract SVRouterSmokeTest is Test {
         uint256 fee = AMOUNT_IN * 50 / 10_000; // 0.5 % of the input, rounded down: 5e18
         uint256 net = AMOUNT_IN - fee;
         universalRouter.setOutput(address(token1), OUTPUT);
-
-        ISVRouter.SwapParams memory p = ISVRouter.SwapParams({
-            key: key,
-            zeroForOne: true,
-            amountIn: AMOUNT_IN,
-            amountOutMin: OUTPUT,
-            hookData: "",
-            deadline: block.timestamp + 1 hours
-        });
-        ISignatureTransfer.PermitTransferFrom memory permit = ISignatureTransfer.PermitTransferFrom({
-            permitted: ISignatureTransfer.TokenPermissions({token: address(token0), amount: AMOUNT_IN}),
-            nonce: 0,
-            deadline: block.timestamp + 1 hours
-        });
-        bytes memory signature = Permit2Signer.sign(USER_KEY, permit2, permit, address(router));
+        (ISVRouter.SwapParams memory p, ISignatureTransfer.PermitTransferFrom memory permit, bytes memory signature) =
+            _signedBuy(0);
 
         vm.expectEmit(true, true, true, true, address(router));
         emit ISVRouter.Trade(
@@ -112,5 +107,105 @@ contract SVRouterSmokeTest is Test {
         assertEq(universalRouter.lastCommands(), abi.encodePacked(uint8(Commands.V4_SWAP)), "one V4_SWAP command");
         assertEq(universalRouter.lastInputs().length, 1, "one input");
         assertEq(universalRouter.lastDeadline(), p.deadline, "deadline forwarded");
+
+        // Every field the mock decoded is what the spec says the router sends.
+        MockUniversalRouter.RecordedSwap memory s = universalRouter.lastSwapParams();
+        assertEq(Currency.unwrap(s.key.currency0), address(token0), "key.currency0");
+        assertEq(Currency.unwrap(s.key.currency1), address(token1), "key.currency1");
+        assertEq(uint256(s.key.fee), uint256(key.fee), "key.fee");
+        assertEq(int256(s.key.tickSpacing), int256(key.tickSpacing), "key.tickSpacing");
+        assertEq(address(s.key.hooks), address(key.hooks), "key.hooks");
+        assertTrue(s.zeroForOne, "zeroForOne");
+        assertEq(s.amountIn, net, "swap amountIn is the net amount");
+        assertEq(uint256(s.amountOutMinimum), uint256(OUTPUT), "amountOutMinimum is the user's bound");
+        assertEq(s.minHopPriceX36, 0, "per-hop price floor off");
+        assertEq(s.hookData.length, 0, "hookData passed through");
+        assertEq(s.settleCurrency, address(token0), "settle currency is tokenIn");
+        assertEq(s.settleAmount, net, "settle amount is exactly net, not the open delta");
+        assertFalse(s.settlePayerIsUser, "the router itself pays");
+        assertEq(s.takeCurrency, address(token1), "take currency is tokenOut");
+        assertEq(s.takeRecipient, user, "take recipient is the user");
+        assertEq(s.takeAmount, uint256(ActionConstants.OPEN_DELTA), "take amount is the open delta");
+    }
+
+    function test_a_codeless_or_reverting_suits_nft_costs_the_holder_rate_not_the_trade() public {
+        uint256 fullFee = AMOUNT_IN * 50 / 10_000;
+        universalRouter.setOutput(address(token1), OUTPUT);
+
+        vm.prank(owner);
+        router.setSuitsNft(makeAddr("no-code"));
+        (uint256 fee, bool holderRate) = router.feeFor(user, AMOUNT_IN);
+        assertEq(fee, fullFee, "codeless NFT: full fee");
+        assertFalse(holderRate, "codeless NFT: not a holder");
+
+        RevertingNFT reverting = new RevertingNFT(); // deployed first: a creation would consume the prank
+        vm.prank(owner);
+        router.setSuitsNft(address(reverting));
+        (fee, holderRate) = router.feeFor(user, AMOUNT_IN);
+        assertEq(fee, fullFee, "reverting NFT: full fee");
+        assertFalse(holderRate, "reverting NFT: not a holder");
+
+        // The trade itself goes through with the reverting NFT configured.
+        (ISVRouter.SwapParams memory p, ISignatureTransfer.PermitTransferFrom memory permit, bytes memory signature) =
+            _signedBuy(0);
+        vm.prank(user);
+        assertEq(router.swapExactIn(p, permit, signature), OUTPUT, "the trade completes");
+        assertEq(token0.balanceOf(feeWallet), fullFee, "full fee taken");
+
+        // A real holder gets the holder rate.
+        vm.prank(owner);
+        router.setSuitsNft(address(nft));
+        nft.mint(user, 1);
+        (fee, holderRate) = router.feeFor(user, AMOUNT_IN);
+        assertEq(fee, 0, "holder: holderFeeBps is 0 at deploy");
+        assertTrue(holderRate, "holder rate applies");
+    }
+
+    function test_renounce_ownership_is_disabled() public {
+        vm.prank(owner);
+        vm.expectRevert(ISVRouter.RenounceDisabled.selector);
+        router.renounceOwnership();
+        assertEq(router.owner(), owner, "still owned");
+    }
+
+    function test_sweep_needs_a_recipient_and_emits_swept() public {
+        token1.mint(address(router), 7e18);
+
+        vm.prank(owner);
+        vm.expectRevert(ISVRouter.ZeroAddress.selector);
+        router.sweep(address(token1), address(0), 7e18);
+
+        vm.expectEmit(true, true, true, true, address(router));
+        emit ISVRouter.Swept(address(token1), owner, 7e18);
+        vm.prank(owner);
+        router.sweep(address(token1), owner, 7e18);
+        assertEq(token1.balanceOf(owner), 7e18, "swept to the owner");
+        assertEq(token1.balanceOf(address(router)), 0, "router empty again");
+    }
+
+    /// @dev One buy of AMOUNT_IN token0 for at least OUTPUT token1, signed by the user for this router.
+    function _signedBuy(uint256 nonce)
+        internal
+        view
+        returns (
+            ISVRouter.SwapParams memory p,
+            ISignatureTransfer.PermitTransferFrom memory permit,
+            bytes memory signature
+        )
+    {
+        p = ISVRouter.SwapParams({
+            key: key,
+            zeroForOne: true,
+            amountIn: AMOUNT_IN,
+            amountOutMin: OUTPUT,
+            hookData: "",
+            deadline: block.timestamp + 1 hours
+        });
+        permit = ISignatureTransfer.PermitTransferFrom({
+            permitted: ISignatureTransfer.TokenPermissions({token: address(token0), amount: AMOUNT_IN}),
+            nonce: nonce,
+            deadline: block.timestamp + 1 hours
+        });
+        signature = Permit2Signer.sign(USER_KEY, permit2, permit, address(router));
     }
 }
