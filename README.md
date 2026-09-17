@@ -49,7 +49,9 @@ forge coverage --report summary              # src/SVRouter.sol must read 100 % 
 ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com forge test --match-path 'test/fork/*' -vv
 ```
 
-The public RPC keeps about 50,000 blocks of state, so if the pinned block has aged out, add `ROBINHOOD_FORK_BLOCK=<a recent block>`; the failure is loud, never silent.
+The public RPC serves only recent state, and the window varies (a pinned block was refused after about fifteen minutes once), so if the pinned block has aged out, add `ROBINHOOD_FORK_BLOCK=<a recent block>`; the failure is loud, never silent. Continuous runs need an archive endpoint (an Alchemy Robinhood Chain URL works) in `ROBINHOOD_RPC_URL`.
+
+**Two facts the fork suite established (17 Sep 2026):** NVDA moves freely through Permit2, the router and the Universal Router, so the Robinhood stock token carries no transfer allowlist or blocklist (the README's M2 open item); and LONG tokens from the Doppler template report an unlimited Permit2 allowance for every holder, so the app never needs an approval transaction for them (the other listed assets need the one-time Permit2 approval).
 
 **Not done on purpose:** no deployment, no Blockscout verification, no GitHub remote, no frontend wiring. All of that starts after your review.
 
