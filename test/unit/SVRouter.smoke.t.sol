@@ -30,7 +30,10 @@ contract RevertingNFT {
 contract SVRouterSmokeTest is Test {
     uint256 internal constant USER_KEY = 0xA11CE;
     uint128 internal constant AMOUNT_IN = 1_000e18;
-    uint128 internal constant OUTPUT = 3e18;
+    /// @dev What the caller demands and what the pool pays, deliberately different and in this order, so that
+    ///      a router reporting `amountOutMin` instead of the measured output would fail the assertions below.
+    uint128 internal constant MIN_OUT = 3e18;
+    uint128 internal constant OUTPUT = 4e18;
 
     address internal user;
     address internal owner;
@@ -60,7 +63,9 @@ contract SVRouterSmokeTest is Test {
             currency1: Currency.wrap(address(token1)),
             fee: 3000,
             tickSpacing: 60,
-            hooks: IHooks(address(0))
+            // A non-zero hook, as every real pool has: the `key.hooks` assertion below would be vacuous
+            // against address(0). The mock never calls it, so it needs no code.
+            hooks: IHooks(makeAddr("pool hook"))
         });
 
         nft = new MockERC721();
@@ -118,7 +123,7 @@ contract SVRouterSmokeTest is Test {
         assertEq(address(s.key.hooks), address(key.hooks), "key.hooks");
         assertTrue(s.zeroForOne, "zeroForOne");
         assertEq(s.amountIn, net, "swap amountIn is the net amount");
-        assertEq(uint256(s.amountOutMinimum), uint256(OUTPUT), "amountOutMinimum is the user's bound");
+        assertEq(uint256(s.amountOutMinimum), uint256(MIN_OUT), "amountOutMinimum is the user's bound");
         assertEq(s.minHopPriceX36, 0, "per-hop price floor off");
         assertEq(s.hookData.length, 0, "hookData passed through");
         assertEq(s.settleCurrency, address(token0), "settle currency is tokenIn");
@@ -202,7 +207,7 @@ contract SVRouterSmokeTest is Test {
         assertEq(token1.balanceOf(address(router)), 0, "router empty again");
     }
 
-    /// @dev One buy of AMOUNT_IN token0 for at least OUTPUT token1, signed by the user for this router.
+    /// @dev One buy of AMOUNT_IN token0 for at least MIN_OUT token1, signed by the user for this router.
     function _signedBuy(uint256 nonce)
         internal
         view
@@ -216,7 +221,7 @@ contract SVRouterSmokeTest is Test {
             key: key,
             zeroForOne: true,
             amountIn: AMOUNT_IN,
-            amountOutMin: OUTPUT,
+            amountOutMin: MIN_OUT,
             hookData: "",
             deadline: block.timestamp + 1 hours
         });
