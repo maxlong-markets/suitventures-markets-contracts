@@ -98,6 +98,8 @@ Sell-side fees arrive in the token being sold (the README's Fees table says so);
 - `sweep` exists only for tokens sent to the router by mistake; the router holds nothing after a swap. It requires a non-zero `to` and emits `Swept`. Kobe may strike it in review.
 - `renounceOwnership` is overridden to revert: a router with no owner could never change its fee wallet again.
 - The holder rate is a spot `balanceOf` check with no lock-up, so at 0 bps anyone who borrows a Suits NFT for one transaction pays no fee. This follows D34 as written; whether that is acceptable, or the discount should be smaller than 100 %, is Kobe's and the client's call.
+- Because the settle is exact, a hook that charges a delta on the input side would make every trade on that pool revert rather than partially fill. None of the listed hooks does (MemeHook is afterSwap-only on the output; Doppler's dynamic fee is an LP fee inside the swap); the fork tests prove it on the three pools.
+- The Suits NFT guard tolerates a codeless address, a reverting `balanceOf` and a malformed reply (low-level static call, reply must be exactly 32 bytes); any of those costs the holder rate, never the trade.
 - Fee-on-transfer or rebasing input tokens are unsupported: the router receives less than `amountIn`, cannot cover the settle, and the call reverts.
 - `Trade` events are user-triggerable with any pool key and any tokens (a self-made pool with self-made tokens), so anything that indexes them must filter by known pools rather than trust the fields.
 - Exact-output ("I want exactly N tokens") is out of scope; the app derives the input amount from a Quoter exact-output quote and executes exact input.
