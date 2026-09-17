@@ -14,6 +14,7 @@ import {SVRouter} from "../../src/SVRouter.sol";
 import {ISVRouter} from "../../src/interfaces/ISVRouter.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {MockERC721} from "../mocks/MockERC721.sol";
+import {MockERC721ShortReply} from "../mocks/MockERC721ShortReply.sol";
 import {MockUniversalRouter} from "../mocks/MockUniversalRouter.sol";
 import {Permit2Signer} from "../utils/Permit2Signer.sol";
 
@@ -159,6 +160,24 @@ contract SVRouterSmokeTest is Test {
         (fee, holderRate) = router.feeFor(user, AMOUNT_IN);
         assertEq(fee, 0, "holder: holderFeeBps is 0 at deploy");
         assertTrue(holderRate, "holder rate applies");
+    }
+
+    function test_a_short_reply_suits_nft_costs_the_holder_rate_not_the_trade() public {
+        uint256 fullFee = AMOUNT_IN * 50 / 10_000;
+        universalRouter.setOutput(address(token1), OUTPUT);
+        MockERC721ShortReply shortReply = new MockERC721ShortReply(); // deployed before the prank
+        vm.prank(owner);
+        router.setSuitsNft(address(shortReply));
+
+        (uint256 fee, bool holderRate) = router.feeFor(user, AMOUNT_IN);
+        assertEq(fee, fullFee, "short reply: full fee");
+        assertFalse(holderRate, "short reply: not a holder");
+
+        (ISVRouter.SwapParams memory p, ISignatureTransfer.PermitTransferFrom memory permit, bytes memory signature) =
+            _signedBuy(0);
+        vm.prank(user);
+        assertEq(router.swapExactIn(p, permit, signature), OUTPUT, "the trade completes");
+        assertEq(token0.balanceOf(feeWallet), fullFee, "at the normal fee");
     }
 
     function test_renounce_ownership_is_disabled() public {
