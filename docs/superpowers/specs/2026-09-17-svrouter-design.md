@@ -66,7 +66,7 @@ Custom errors: `Expired()`, `ZeroAmount()`, `ZeroAddress()`, `PermitMismatch()`,
 1. `block.timestamp > p.deadline` reverts `Expired()`; `p.amountIn == 0` reverts `ZeroAmount()`. `tokenIn` and `tokenOut` come from the key and `zeroForOne`.
 2. `permit.permitted.token != tokenIn` or `permit.permitted.amount < p.amountIn` reverts `PermitMismatch()`. Then `permit2.permitTransferFrom(permit, {to: address(this), requestedAmount: p.amountIn}, msg.sender, signature)` pulls exactly `amountIn` into the router (Permit2 enforces the signature, nonce and deadline).
 3. `fee = amountIn * bps / 10_000`, where `bps = holderFeeBps` if `suitsNft != address(0) && IERC721(suitsNft).balanceOf(msg.sender) > 0`, else `feeBps`. Rounds down. `fee` goes to `feeWallet` with `SafeERC20.safeTransfer`; `amountIn - fee` goes to the Universal Router the same way.
-4. One Universal Router call: `execute(commands = [V4_SWAP], inputs = [abi.encode(actions, params)], p.deadline)` with actions `SWAP_EXACT_IN_SINGLE(key, zeroForOne, amountIn - fee, amountOutMin, hookData)`, `SETTLE(tokenIn, OPEN_DELTA, payerIsUser = false)` (the router pays from the tokens it now holds), `TAKE(tokenOut, recipient = msg.sender, OPEN_DELTA)` (output goes straight to the user; the router never holds it, so LONG's early per-wallet caps cannot trip on an intermediary). The command and action bytes are taken from the installed `universal-router` and `v4-periphery` libraries, never hand-written.
+4. One Universal Router call: `execute(commands = [V4_SWAP], inputs = [abi.encode(actions, params)], p.deadline)` with actions `SWAP_EXACT_IN_SINGLE(key, zeroForOne, amountIn - fee, amountOutMin, minHopPriceX36 = 0, hookData)` (the deployed router speaks v4-periphery's six-field `ExactInputSingleParams`; zero disables the per-hop price check, verified against the live bytecode on 17 Sep 2026), `SETTLE(tokenIn, OPEN_DELTA, payerIsUser = false)` (the router pays from the tokens it now holds), `TAKE(tokenOut, recipient = msg.sender, OPEN_DELTA)` (output goes straight to the user; the router never holds it, so LONG's early per-wallet caps cannot trip on an intermediary). The command and action bytes are taken from the installed `universal-router` and `v4-periphery` libraries, never hand-written.
 5. `amountOut` is the user's `tokenOut` balance after minus before the call (the hook may take its fee from the output, which the Quoter already reflects). `amountOut < p.amountOutMin` reverts `InsufficientOutput` (the Universal Router enforces the same bound; this is the belt to its braces).
 6. Emit `Trade(msg.sender, key.toId(), tokenIn, tokenOut, amountIn, fee, amountOut, holderRate)` and return `amountOut`.
 7. `nonReentrant` on the function; no state other than the fee settings and the NFT address; no allowances granted by the router to anyone; the router's balance of both tokens is what it was before the call (asserted in tests).
@@ -83,6 +83,13 @@ Sell-side fees arrive in the token being sold (the README's Fees table says so);
 - Fork tests run against Robinhood Chain at a pinned block through `ROBINHOOD_RPC_URL`: real Permit2 signatures from a test key, the real Universal Router, the three pools above in both directions, a holder (mock NFT minted to the user) and a non-holder, asserting the fee in the fee wallet, the user's output at or above the Quoter's quote minus slippage, the `Trade` event, and a revert on an impossible `amountOutMin`. They are skipped, not failed, when the RPC variable is unset.
 - The deploy script takes owner, fee wallet and NFT from the environment, prints the address, and verifies on Blockscout (`https://robinhoodchain.blockscout.com/api`). Deployment itself waits for Kobe's review.
 - Static checks: `forge fmt --check`, `forge build --sizes`, and Slither if it is installed.
+
+## 6a. Implementation notes for the review (17 Sep 2026)
+
+- A zero fee (holder rate 0 bps) is not transferred at all; the fee wallet sees no zero-value transfer.
+- The constructor emits `FeeWalletChanged`, `FeesChanged` and `SuitsNftChanged` with the initial values, so indexers see the deploy state.
+- The Universal Router call lives in an internal `_executeSwap` (stack depth without via-IR).
+- Dependencies pinned: universal-router 2.1.1, v4-periphery 3231810e, permit2 cc56ad0f, OpenZeppelin 5.7.0; unit tests etch Permit2's real bytecode at its canonical address (its sources pin solc 0.8.17).
 
 ## 7. Risks and open items
 
