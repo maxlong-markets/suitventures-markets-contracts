@@ -31,22 +31,29 @@ import {Permit2Signer} from "../utils/Permit2Signer.sol";
 ///      Skipping: `setUp` calls `vm.skip(true)` and returns when `ROBINHOOD_RPC_URL` is unset, so `forge test`
 ///      with no network reports these tests as skipped, never as failed (spec section 6).
 ///
-///      The pinned block: `FORK_BLOCK` is the block this suite was written against, so Foundry's RPC cache makes
-///      reruns cheap. The public endpoint is *not* a full archive: on 17 Sep 2026 it served roughly the last
-///      50_000 blocks (about 80 minutes at this chain's ~0.1 s blocks) and answered
-///      `historical state ... is not available` for anything older. A rerun long after the pin therefore needs
-///      either Foundry's cache from an earlier run or a fresh block, which `ROBINHOOD_FORK_BLOCK` supplies
-///      without editing this file. Every assertion here is relative to the state of whichever block is used -
-///      the quote is read from the same fork, at the same state, as the swap it bounds - so a re-pin changes the
-///      numbers in the logs and nothing else.
+///      The pinned block, and why it will go stale: `FORK_BLOCK` is the block this suite was last run against,
+///      so Foundry's RPC cache makes an immediate rerun cheap. The public endpoint is *not* an archive node, and
+///      its window is short and not a fixed depth - measured on 17 Sep 2026, it served state 46_770 blocks
+///      behind the head at one moment and refused state only 9_034 blocks behind it (about 15 minutes at this
+///      chain's ~0.1 s blocks) a quarter of an hour later, with
+///      `error -32000: historical state ... is not available`. Treat a pin as good for minutes, not hours.
+///      A rerun therefore needs either Foundry's cache from an earlier run *covering every slot the run touches*
+///      - adding an assertion that reads a new slot is enough to defeat a warm cache - or a fresh block, which
+///      `ROBINHOOD_FORK_BLOCK` supplies without editing this file. Every assertion here is relative to the state
+///      of whichever block is used - the quote is read from the same fork, at the same state, as the swap it
+///      bounds - so a re-pin changes the numbers in the logs and nothing else. `setUp` logs the block it forked.
+///
+///      `ROBINHOOD_FORK_BLOCK` must either name a block or be left unset: `vm.envOr` parses it as a `uint256`,
+///      so an *empty* value (`ROBINHOOD_FORK_BLOCK=` in a `.env`, or `export ROBINHOOD_FORK_BLOCK=`) fails to
+///      parse rather than falling back to `FORK_BLOCK`. Unset it instead of blanking it.
 contract SVRouterForkTest is Test {
     // -------------------------------------------------------------------------------------------------------
     // Chain facts (spec section 2). Addresses are the spec's, in their EIP-55 checksummed spelling.
     // -------------------------------------------------------------------------------------------------------
 
-    /// @dev Robinhood Chain (id 4663), block 65_232_000, 17 Sep 2026 08:42 UTC (16:42 Manila). The block this
+    /// @dev Robinhood Chain (id 4663), block 65_241_000, 17 Sep 2026 09:26 UTC (17:26 Manila). The block this
     ///      suite was written and run against; see the note above on re-pinning past the endpoint's window.
-    uint256 internal constant FORK_BLOCK = 65_232_000;
+    uint256 internal constant FORK_BLOCK = 65_241_000;
 
     address internal constant UNIVERSAL_ROUTER = 0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99;
     address internal constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
@@ -119,6 +126,8 @@ contract SVRouterForkTest is Test {
         }
         vm.createSelectFork(rpcUrl, vm.envOr("ROBINHOOD_FORK_BLOCK", FORK_BLOCK));
         assertEq(block.chainid, 4663, "forked the wrong chain");
+        // Which block the numbers below came from, so a `-vv` run is self-documenting after a re-pin.
+        console2.log("forked block", block.number);
 
         user = vm.addr(USER_KEY);
         owner = vm.addr(OWNER_KEY);
@@ -242,7 +251,9 @@ contract SVRouterForkTest is Test {
     // -------------------------------------------------------------------------------------------------------
 
     /// @notice A Suits NFT holder pays nothing at the deploy rates (`holderFeeBps` = 0), and the fee wallet sees
-    ///         no transfer at all - the router skips a zero-value transfer on purpose (spec section 6a).
+    ///         no transfer at all - the router skips a zero-value transfer on purpose (spec section 6a). The
+    ///         absent transfer, not just the zero balance, is what `_assertLogs` proves: it counts the input
+    ///         token's `Transfer` events addressed to the fee wallet and requires none here.
     function test_holder_pays_no_fee() public {
         suitsNft.mint(user, 1);
         assertEq(suitsNft.balanceOf(user), 1, "the user holds a Suits NFT");
@@ -278,6 +289,9 @@ contract SVRouterForkTest is Test {
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
 
+        // As in the oversize case below: a top-level revert has already undone everything, so these four cannot
+        // fail. They document the invariant; `_assertBalancesMoved` is where it is actually tested, after a call
+        // that went through.
         assertEq(IERC20(NVDA).balanceOf(user), userBefore, "the user's NVDA is untouched");
         assertEq(IERC20(NVDA).balanceOf(feeWallet), 0, "no fee was kept");
         assertEq(IERC20(NVDA).balanceOf(UNIVERSAL_ROUTER), urBefore, "nothing left in the Universal Router");
@@ -343,11 +357,15 @@ contract SVRouterForkTest is Test {
         uint256 urAiBefore = IERC20(AI).balanceOf(UNIVERSAL_ROUTER);
 
         (ISVRouter.SwapParams memory p, ISignatureTransfer.PermitTransferFrom memory permit, bytes memory signature) =
-            _sign(aiKey, false, NVDA_OVERSIZE_IN, uint128(_withSlippage(quotedAtDustPrice)));
+            _sign(aiKey, false, NVDA_OVERSIZE_IN, _toUint128(_withSlippage(quotedAtDustPrice)));
         vm.expectPartialRevert(IV4Router.V4TooLittleReceived.selector);
         vm.prank(user);
         router.swapExactIn(p, permit, signature);
 
+        // Honest about what these four prove: the revert is at the top level, so the EVM has already rolled the
+        // whole call back and they cannot fail. They are here to document the invariant and to pin the balances
+        // a future non-reverting regression would move. The load-bearing evidence that nothing is stranded is in
+        // `_assertBalancesMoved`, where the same four run after a call that *succeeded*.
         assertEq(IERC20(NVDA).balanceOf(UNIVERSAL_ROUTER), urNvdaBefore, "the Universal Router's NVDA is unchanged");
         assertEq(IERC20(AI).balanceOf(UNIVERSAL_ROUTER), urAiBefore, "the Universal Router's AI is unchanged");
         assertEq(IERC20(NVDA).balanceOf(user), userBefore, "the user's NVDA is untouched");
@@ -372,7 +390,8 @@ contract SVRouterForkTest is Test {
         uint256 amountOut;
     }
 
-    /// @dev Balances of everyone who could be left holding something, read before a trade.
+    /// @dev Balances of everyone who could be left holding something, plus the allowances the router must never
+    ///      grant, read before a trade and again after it.
     struct Balances {
         uint256 feeWallet;
         uint256 userIn;
@@ -381,6 +400,10 @@ contract SVRouterForkTest is Test {
         uint256 routerOut;
         uint256 universalRouterIn;
         uint256 universalRouterOut;
+        uint256 routerToUniversalRouterIn;
+        uint256 routerToUniversalRouterOut;
+        uint256 routerToPermit2In;
+        uint256 routerToPermit2Out;
     }
 
     /// @dev One trade through the real stack, with every assertion the spec's section 6 asks for:
@@ -413,11 +436,11 @@ contract SVRouterForkTest is Test {
         assertGt(t.quote, 0, "the pool quoted nothing");
 
         Balances memory before = _balances(t.tokenIn, t.tokenOut);
-        t.amountOut = _execute(key, zeroForOne, amountIn, uint128(_withSlippage(t.quote)));
+        t.amountOut = _execute(key, zeroForOne, amountIn, _toUint128(_withSlippage(t.quote)));
         console2.log(string.concat(label, ": in / fee / out"), uint256(amountIn), t.fee, t.amountOut);
 
         _assertBalancesMoved(t, before, amountIn);
-        _assertTradeEvent(key, t, amountIn, expectHolderRate);
+        _assertLogs(key, t, amountIn, expectHolderRate);
     }
 
     /// @dev Signs and sends one trade as the user, recording the logs the event assertions read.
@@ -447,10 +470,26 @@ contract SVRouterForkTest is Test {
 
         // Nothing stranded anywhere: the router holds neither token (it never does, spec section 4.7), and the
         // Universal Router's balances are what they were, which is what settling the exact net amount buys.
+        // These four are the suite's real evidence that nothing is stranded: they follow a call that *succeeded*,
+        // so the state they read is state the chain kept.
         assertEq(a.routerIn, 0, "router holds no tokenIn");
         assertEq(a.routerOut, 0, "router holds no tokenOut");
         assertEq(a.universalRouterIn, before.universalRouterIn, "Universal Router: tokenIn unchanged");
         assertEq(a.universalRouterOut, before.universalRouterOut, "Universal Router: tokenOut unchanged");
+
+        // The router granted no allowance to anyone (global constraint; spec section 4.7): it pays with plain
+        // transfers and never calls `approve`. The Universal Router's allowance is zero outright - a standing
+        // allowance there would let anyone move the router's tokens through it - and Permit2's is whatever it
+        // was before the call, because a token may grant it by itself.
+        //
+        // It does: LONG's **AI** token returns `type(uint256).max` for `allowance(anyone, Permit2)` - the
+        // Uniswap built-in-Permit2-approval ERC20 pattern - for every address on the chain, with no `approve`
+        // ever sent. NVDA, MARIO and microduck all return 0. Asserting "zero after" would therefore have been
+        // asserting a property of the token, not of this router; "unchanged by the call" is the router's part.
+        assertEq(a.routerToUniversalRouterIn, 0, "router granted no allowance: tokenIn to the Universal Router");
+        assertEq(a.routerToUniversalRouterOut, 0, "router granted no allowance: tokenOut to the Universal Router");
+        assertEq(a.routerToPermit2In, before.routerToPermit2In, "router granted no allowance: tokenIn to Permit2");
+        assertEq(a.routerToPermit2Out, before.routerToPermit2Out, "router granted no allowance: tokenOut to Permit2");
     }
 
     function _balances(address tokenIn, address tokenOut) internal view returns (Balances memory b) {
@@ -461,28 +500,49 @@ contract SVRouterForkTest is Test {
         b.routerOut = IERC20(tokenOut).balanceOf(address(router));
         b.universalRouterIn = IERC20(tokenIn).balanceOf(UNIVERSAL_ROUTER);
         b.universalRouterOut = IERC20(tokenOut).balanceOf(UNIVERSAL_ROUTER);
+        b.routerToUniversalRouterIn = IERC20(tokenIn).allowance(address(router), UNIVERSAL_ROUTER);
+        b.routerToUniversalRouterOut = IERC20(tokenOut).allowance(address(router), UNIVERSAL_ROUTER);
+        b.routerToPermit2In = IERC20(tokenIn).allowance(address(router), PERMIT2);
+        b.routerToPermit2Out = IERC20(tokenOut).allowance(address(router), PERMIT2);
     }
 
-    /// @dev Exactly one `Trade` from the router, with the eight values the indexer reads.
-    function _assertTradeEvent(PoolKey memory key, Trade memory t, uint128 amountIn, bool expectHolderRate) internal {
-        bytes32 topic0 = keccak256("Trade(address,bytes32,address,address,uint256,uint256,uint256,bool)");
+    /// @dev What the trade emitted: exactly one `Trade` from the router with the eight values the indexer reads,
+    ///      and exactly as many `Transfer`s of the input token to the fee wallet as there was a fee to pay.
+    ///      The second half is what makes "the holder pays nothing" a statement about the *transfer* and not only
+    ///      about the balance: at a zero fee the router skips the transfer entirely (spec section 6a), so a
+    ///      zero-value `Transfer` to the fee wallet - which some tokens reject outright - must not appear. This
+    ///      mirrors the unit suite's proof in `test/unit/SVRouter.t.sol`.
+    function _assertLogs(PoolKey memory key, Trade memory t, uint128 amountIn, bool expectHolderRate) internal {
+        bytes32 tradeTopic = keccak256("Trade(address,bytes32,address,address,uint256,uint256,uint256,bool)");
+        bytes32 transferTopic = keccak256("Transfer(address,address,uint256)");
         Vm.Log[] memory logs = vm.getRecordedLogs();
-        uint256 found;
+        uint256 trades;
+        uint256 feeTransfers;
         for (uint256 i = 0; i < logs.length; i++) {
-            if (logs[i].emitter != address(router) || logs[i].topics[0] != topic0) continue;
-            found++;
-            assertEq(address(uint160(uint256(logs[i].topics[1]))), user, "Trade.user");
-            assertEq(logs[i].topics[2], PoolId.unwrap(key.toId()), "Trade.poolId");
-            assertEq(address(uint160(uint256(logs[i].topics[3]))), t.tokenIn, "Trade.tokenIn");
-            (address tokenOut, uint256 loggedIn, uint256 loggedFee, uint256 loggedOut, bool loggedHolder) =
-                abi.decode(logs[i].data, (address, uint256, uint256, uint256, bool));
-            assertEq(tokenOut, t.tokenOut, "Trade.tokenOut");
-            assertEq(loggedIn, amountIn, "Trade.amountIn");
-            assertEq(loggedFee, t.fee, "Trade.fee");
-            assertEq(loggedOut, t.amountOut, "Trade.amountOut");
-            assertEq(loggedHolder, expectHolderRate, "Trade.holderRate");
+            if (logs[i].emitter == address(router) && logs[i].topics[0] == tradeTopic) {
+                trades++;
+                assertEq(address(uint160(uint256(logs[i].topics[1]))), user, "Trade.user");
+                assertEq(logs[i].topics[2], PoolId.unwrap(key.toId()), "Trade.poolId");
+                assertEq(address(uint160(uint256(logs[i].topics[3]))), t.tokenIn, "Trade.tokenIn");
+                (address tokenOut, uint256 loggedIn, uint256 loggedFee, uint256 loggedOut, bool loggedHolder) =
+                    abi.decode(logs[i].data, (address, uint256, uint256, uint256, bool));
+                assertEq(tokenOut, t.tokenOut, "Trade.tokenOut");
+                assertEq(loggedIn, amountIn, "Trade.amountIn");
+                assertEq(loggedFee, t.fee, "Trade.fee");
+                assertEq(loggedOut, t.amountOut, "Trade.amountOut");
+                assertEq(loggedHolder, expectHolderRate, "Trade.holderRate");
+                continue;
+            }
+            // A standard ERC20 `Transfer` of the input token, addressed to the fee wallet.
+            if (logs[i].emitter != t.tokenIn || logs[i].topics.length != 3) continue;
+            if (logs[i].topics[0] != transferTopic) continue;
+            if (address(uint160(uint256(logs[i].topics[2]))) != feeWallet) continue;
+            feeTransfers++;
+            assertEq(address(uint160(uint256(logs[i].topics[1]))), address(router), "the fee came from the router");
+            assertEq(abi.decode(logs[i].data, (uint256)), t.fee, "the fee transfer's value");
         }
-        assertEq(found, 1, "exactly one Trade event");
+        assertEq(trades, 1, "exactly one Trade event");
+        assertEq(feeTransfers, t.fee == 0 ? 0 : 1, "one fee transfer when there is a fee, none when there is not");
     }
 
     /// @dev The router holds neither side of the trade afterwards; it never does, by design (spec section 4.7).
@@ -506,6 +566,17 @@ contract SVRouterForkTest is Test {
     /// @dev A quote less the 1 % slippage the app allows: the `amountOutMin` a real trade would carry.
     function _withSlippage(uint256 quote) internal pure returns (uint256) {
         return quote * (10_000 - SLIPPAGE_BPS) / 10_000;
+    }
+
+    /// @dev `amountOutMin` is a `uint128` in the router's params, so every bound this suite computes has to fit.
+    ///      The largest one here is the AI pool's dust-price extrapolation, about 1.97e30, six orders of
+    ///      magnitude below `type(uint128).max` (3.4e38) - but the check is made rather than assumed, so that a
+    ///      re-pin against a pool whose price has moved fails on this line instead of silently truncating a
+    ///      bound to something the swap can meet.
+    function _toUint128(uint256 value) internal pure returns (uint128) {
+        require(value <= type(uint128).max, "bound does not fit in uint128");
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return uint128(value);
     }
 
     /// @dev One signed trade for `user`: the router's params, the Permit2 message for the input token at the
