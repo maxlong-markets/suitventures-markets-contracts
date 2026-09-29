@@ -68,6 +68,28 @@ contract DeployLaunchpadTest is Test {
         assertEq(c.rows[2].referenceUsdPrice, 0, "AMC's reference price not filled yet");
     }
 
+    /// @dev One test, not two, because `vm.setEnv` writes the process environment that parallel tests share.
+    ///      With OWNER set, the run gets past the owner guard and stops at the next one, which proves the order.
+    function test_run_refuses_a_zero_OWNER_before_touching_the_config() public {
+        vm.chainId(4663);
+        // Sets one input of run() for this test; nothing else in the suite reads it.
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        vm.setEnv("FEE_WALLET", vm.toString(makeAddr("feeWallet")));
+        // Sets one input of run() for this test; nothing else in the suite reads it.
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        vm.setEnv("LAUNCHER_GATE", vm.toString(address(0)));
+        // Sets one input of run() for this test; nothing else in the suite reads it.
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        vm.setEnv("OWNER", vm.toString(address(0)));
+        vm.expectRevert(bytes("OWNER is zero: set it in .env"));
+        script.run();
+        // Sets one input of run() for this test; nothing else in the suite reads it.
+        // forge-lint: disable-next-line(unsafe-cheatcode)
+        vm.setEnv("OWNER", vm.toString(makeAddr("owner")));
+        vm.expectRevert(bytes("POOL_MANAGER has no code on this chain"));
+        script.run();
+    }
+
     function test_parseConfig_refuses_a_minUsd_not_below_maxUsd() public {
         vm.expectRevert(bytes("minUsd must be below maxUsd"));
         script.parseConfig('{"minUsd":5000,"maxUsd":5000,"creationFee":"0","currencies":[]}');

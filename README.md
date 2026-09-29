@@ -129,7 +129,8 @@ forge script script/DeployLaunchpad.s.sol --rpc-url robinhood --account <keystor
 ```
 
 The broadcaster deploys with itself as owner, allows every currency, then transfers ownership to `OWNER`. When
-`OWNER` is another key, it must call `acceptOwnership`. Verify through Sourcify with the constructor arguments
+`OWNER` is another key, it must call `acceptOwnership`. The script refuses a zero `OWNER`, which is the placeholder
+in `.env.example`, so the broadcaster can never stay owner by mistake. Verify through Sourcify with the constructor arguments
 PoolManager, Permit2, the broadcaster, `FEE_WALLET` and `LAUNCHER_GATE`, and with the optimizer runs the launch
 profile in `foundry.toml` sets, 200:
 

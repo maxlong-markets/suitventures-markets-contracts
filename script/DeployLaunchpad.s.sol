@@ -70,6 +70,8 @@ contract DeployLaunchpad is Script {
         address permit2 = vm.envOr("PERMIT2", CANONICAL_PERMIT2);
 
         require(block.chainid == ROBINHOOD_CHAIN_ID, "not Robinhood Chain (chain id 4663): check --rpc-url");
+        // The .env.example placeholder is the zero address; deploying with it would leave the broadcaster as owner.
+        require(owner != address(0), "OWNER is zero: set it in .env");
         if (!vm.envOr("ALLOW_OTHER_ADDRESSES", false)) {
             require(
                 poolManager == ROBINHOOD_POOL_MANAGER,
