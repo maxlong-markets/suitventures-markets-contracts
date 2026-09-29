@@ -184,6 +184,17 @@ interface ISVLaunchpad {
         bytes calldata signature
     ) external returns (address token);
 
+    /// @notice Anyone. Collect the fees accrued to a launch's position and split them between its payout address
+    ///         and the fee wallet; a share whose delivery fails is credited to `owed` instead.
+    function collectFees(address token) external;
+
+    /// @notice Pays msg.sender's whole owed balance in `currency`, credited when a fee delivery failed, to `to`;
+    ///         `to` of address(0), this contract or the PoolManager reverts BadPayout. Emits nothing.
+    function claim(address currency, address to) external;
+
+    /// @notice The launch's current payout address only.
+    function setPayout(address token, address payout) external;
+
     /// @notice The PoolManager only, during the launchpad's own unlock. Returns abi.encode(LaunchResult) for
     ///         Action.Launch and abi.encode(uint256 tokenFees, uint256 quoteFees) for Action.Collect.
     function unlockCallback(bytes calldata data) external returns (bytes memory);
@@ -229,6 +240,9 @@ interface ISVLaunchpad {
     /// @notice The pool key of a launch; reverts `UnknownLaunch` for a token not launched here.
     function poolKeyOf(address token) external view returns (PoolKey memory);
 
+    /// @notice What a collection would take now, in token and quote terms, with its split; reverts UnknownLaunch.
+    function uncollectedFees(address token) external view returns (PendingFees memory);
+
     /// @notice The token address a launch by `creator` with this salt, name and symbol would deploy.
     function predictToken(address creator, bytes32 salt, string calldata name, string calldata symbol)
         external
@@ -249,6 +263,9 @@ interface ISVLaunchpad {
 
     /// @notice The bounds and creation fee of a quote currency; all zeros when not allowed.
     function currency(address quote) external view returns (CurrencyConfig memory);
+
+    /// @notice What `account` can claim in `currency`: its shares whose delivery failed.
+    function owed(address account, address currency) external view returns (uint256);
 
     /// @notice How many launches have been made.
     function launchCount() external view returns (uint256);

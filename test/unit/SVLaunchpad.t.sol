@@ -319,6 +319,46 @@ abstract contract SVLaunchpadTestBase is Test {
     function _expectOnePermitPull() internal {
         vm.expectCall(permit2, abi.encodePacked(PERMIT_PULL), 1);
     }
+
+    /// @dev One exact-input trade through v4-core's PoolSwapTest, paid by this test contract: a buy spends
+    ///      `amountIn` of the quote, a sell `amountIn` of the token. The price limit is the far end, so the whole
+    ///      input is used wherever there is liquidity. Returns what this contract received.
+    function _swap(address token, bool buy, uint256 amountIn) internal returns (uint256 amountOut) {
+        ISVLaunchpad.Launch memory l = launchpad.getLaunch(token);
+        address tokenIn = buy ? l.quote : token;
+        address tokenOut = buy ? token : l.quote;
+        bool zeroForOne = buy ? !l.tokenIsCurrency0 : l.tokenIsCurrency0;
+        IERC20(tokenIn).approve(address(swapRouter), amountIn);
+        uint256 before = IERC20(tokenOut).balanceOf(address(this));
+        swapRouter.swap(
+            launchpad.poolKeyOf(token),
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                // Test amounts are far below 2^255.
+                // forge-lint: disable-next-line(unsafe-typecast)
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        amountOut = IERC20(tokenOut).balanceOf(address(this)) - before;
+    }
+
+    /// @dev The first `FeesCollected` event among `logs`.
+    function _feesCollectedFrom(Vm.Log[] memory logs)
+        internal
+        view
+        returns (uint256 tokenFees, uint256 quoteFees, uint256 tokenToPayout, uint256 quoteToPayout)
+    {
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].emitter != address(launchpad) || logs[i].topics[0] != ISVLaunchpad.FeesCollected.selector) {
+                continue;
+            }
+            return abi.decode(logs[i].data, (uint256, uint256, uint256, uint256));
+        }
+        revert("no FeesCollected event in the recorded logs");
+    }
 }
 
 /// @notice The constructor, the owner settings with every bound of spec section 4.3, ownership, the launcher gate

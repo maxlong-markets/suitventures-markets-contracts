@@ -19,6 +19,8 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {FixedPoint128} from "@uniswap/v4-core/src/libraries/FixedPoint128.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
 import {ISVLaunchpad} from "./interfaces/ISVLaunchpad.sol";
@@ -38,6 +40,7 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     using Hooks for IHooks;
     using SafeERC20 for IERC20;
     using TransientSlot for *;
+    using StateLibrary for IPoolManager;
 
     // -------------------------------------------------------------------------------------------------------
     // Constants (spec section 4.3)
@@ -263,8 +266,12 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         if (msg.sender != address(POOL_MANAGER)) revert NotPoolManager();
         if (!UNLOCKING_SLOT.asBoolean().tload()) revert UnexpectedCallback();
-        (, LaunchCallback memory cb) = abi.decode(data, (Action, LaunchCallback));
-        return _launchCallback(cb);
+        if (abi.decode(data[:32], (Action)) == Action.Launch) {
+            (, LaunchCallback memory cb) = abi.decode(data, (Action, LaunchCallback));
+            return _launchCallback(cb);
+        }
+        (, address token) = abi.decode(data, (Action, address));
+        return _collectCallback(token);
     }
 
     /// @dev Step 3: `block.timestamp / 1 days` is the UTC day number; a new day restarts the count at zero.
@@ -442,6 +449,103 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     }
 
     // -------------------------------------------------------------------------------------------------------
+    // Fees, claims, payout (spec section 4.6)
+    // -------------------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ISVLaunchpad
+    /// @dev The only call that ever touches the position after launch, and it cannot change its liquidity. The
+    ///      split uses the share fixed at launch and the fee wallet read now; the fee wallet takes the rounding
+    ///      dust. Shares are delivered after the unlock has returned, each by a tolerant transfer, so no
+    ///      recipient, and no owner setting, can freeze another recipient's share.
+    function collectFees(address token) external nonReentrant {
+        // 1.
+        Launch memory l = _launchOf(token);
+        // 2. and 3.
+        (uint256 tokenFees, uint256 quoteFees) =
+            abi.decode(_unlock(abi.encode(Action.Collect, token)), (uint256, uint256));
+        // 4.
+        uint256 tokenToPayout = tokenFees * l.creatorShareBps / BPS;
+        uint256 quoteToPayout = quoteFees * l.creatorShareBps / BPS;
+        address wallet = feeWallet;
+        // 5.
+        _deliver(token, l.payout, tokenToPayout);
+        _deliver(token, wallet, tokenFees - tokenToPayout);
+        _deliver(l.quote, l.payout, quoteToPayout);
+        _deliver(l.quote, wallet, quoteFees - quoteToPayout);
+        // 6.
+        emit FeesCollected(token, l.payout, tokenFees, quoteFees, tokenToPayout, quoteToPayout);
+    }
+
+    /// @inheritdoc ISVLaunchpad
+    /// @dev Paying to an address the claimant names is what rescues a recipient the currency refuses: a retry to
+    ///      the same address would fail the same way. The collection already recorded the amount, so no event.
+    function claim(address asset, address to) external nonReentrant {
+        if (to == address(0)) revert BadPayout();
+        _checkPayout(to);
+        uint256 amount = _owed[msg.sender][asset];
+        if (amount == 0) revert NothingOwed();
+        _owed[msg.sender][asset] = 0;
+        IERC20(asset).safeTransfer(to, amount);
+    }
+
+    /// @inheritdoc ISVLaunchpad
+    /// @dev Only the current payout can move it, so the creator loses that right once they hand it on. One
+    ///      storage word changes and nothing is called.
+    function setPayout(address token, address payout) external {
+        Launch storage l = _launches[token];
+        if (l.creator == address(0)) revert UnknownLaunch();
+        address previous = l.payout;
+        if (msg.sender != previous) revert NotPayout();
+        if (payout == address(0)) revert ZeroAddress();
+        _checkPayout(payout);
+        l.payout = payout;
+        emit PayoutChanged(token, previous, payout);
+    }
+
+    /// @dev Steps 2 and 3, inside the unlock: v4's documented poke, `modifyLiquidity` with a zero delta, returns
+    ///      exactly the fees owed since the last checkpoint, which the pool moves so they cannot be paid twice.
+    function _collectCallback(address token) private returns (bytes memory) {
+        Launch memory l = _launches[token];
+        (int24 tickLower, int24 tickUpper) = _range(l.tokenIsCurrency0, l.openTick);
+        (BalanceDelta delta,) = POOL_MANAGER.modifyLiquidity(
+            _key(token, l.quote, l.hook),
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 0, salt: bytes32(0)
+            }),
+            ""
+        );
+        (int128 tokenDelta, int128 quoteDelta) =
+            l.tokenIsCurrency0 ? (delta.amount0(), delta.amount1()) : (delta.amount1(), delta.amount0());
+        if (tokenDelta == 0 && quoteDelta == 0) revert NothingToCollect();
+        return abi.encode(_takeMeasured(token, tokenDelta), _takeMeasured(l.quote, quoteDelta));
+    }
+
+    /// @dev Takes a positive fee delta into this contract and returns the measured increase: a fee-on-transfer
+    ///      quote delivers less than asked, and splitting the asked amount would pay out balance that belongs to
+    ///      earlier credited shares.
+    function _takeMeasured(address asset, int128 delta) private returns (uint256) {
+        if (delta == 0) return 0;
+        uint256 before = IERC20(asset).balanceOf(address(this));
+        // Fees are never negative, so the int128 fits uint128 and uint256 unchanged.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        POOL_MANAGER.take(Currency.wrap(asset), address(this), uint256(uint128(delta)));
+        return IERC20(asset).balanceOf(address(this)) - before;
+    }
+
+    /// @dev Step 5: a low-level `transfer` that counts as delivered on an empty reply or a reply whose first word
+    ///      is 1, the same rule as v4's `CurrencyLibrary.transfer`. A revert, a `false` or any other reply credits
+    ///      `owed` instead, taken later with `claim`. The call forwards all remaining gas; nothing else is bounded.
+    function _deliver(address asset, address to, uint256 amount) private {
+        if (amount == 0) return;
+        (bool ok, bytes memory reply) = asset.call(abi.encodeCall(IERC20.transfer, (to, amount)));
+        // bytes32(reply) reads the reply's first word; the length check above it guarantees the word exists, and a
+        // bytes32 always fits uint256, so the cast truncates nothing.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (ok && (reply.length == 0 || (reply.length >= 32 && uint256(bytes32(reply)) == 1))) return;
+        _owed[to][asset] += amount;
+    }
+
+    // -------------------------------------------------------------------------------------------------------
     // Owner settings (Ownable2Step: a transfer takes effect only when the new owner accepts)
     // -------------------------------------------------------------------------------------------------------
 
@@ -555,6 +659,20 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     }
 
     /// @inheritdoc ISVLaunchpad
+    /// @dev Mirrors `Position.update` over the PoolManager's storage, so a collection in the same block returns
+    ///      the same numbers. `StateLibrary` reads the v4.0.0 layout; the fork suite proves the deployed manager
+    ///      matches.
+    function uncollectedFees(address token) external view returns (PendingFees memory f) {
+        Launch memory l = _launchOf(token);
+        (uint256 fees0, uint256 fees1) = _pendingFees(token, l);
+        (f.tokenFees, f.quoteFees) = l.tokenIsCurrency0 ? (fees0, fees1) : (fees1, fees0);
+        f.tokenToPayout = f.tokenFees * l.creatorShareBps / BPS;
+        f.quoteToPayout = f.quoteFees * l.creatorShareBps / BPS;
+        f.tokenToFeeWallet = f.tokenFees - f.tokenToPayout;
+        f.quoteToFeeWallet = f.quoteFees - f.quoteToPayout;
+    }
+
+    /// @inheritdoc ISVLaunchpad
     /// @dev The same read as SVRouter's Suits check with the opposite failure rule: a raw static call with a gas
     ///      allowance, and the account counts only when the call succeeds, the reply is exactly one word and that
     ///      word is above zero. A codeless gate, a revert, a short reply or a gas-burning gate all mean not
@@ -576,6 +694,11 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     /// @inheritdoc ISVLaunchpad
     function currency(address quote) external view returns (CurrencyConfig memory) {
         return _currencies[quote];
+    }
+
+    /// @inheritdoc ISVLaunchpad
+    function owed(address account, address asset) external view returns (uint256) {
+        return _owed[account][asset];
     }
 
     /// @inheritdoc ISVLaunchpad
@@ -674,6 +797,20 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     function _launchOf(address token) private view returns (Launch memory l) {
         l = _launches[token];
         if (l.creator == address(0)) revert UnknownLaunch();
+    }
+
+    /// @dev The fees `Position.update` would credit now, in currency order.
+    function _pendingFees(address token, Launch memory l) private view returns (uint256 fees0, uint256 fees1) {
+        (int24 tickLower, int24 tickUpper) = _range(l.tokenIsCurrency0, l.openTick);
+        PoolId id = _key(token, l.quote, l.hook).toId();
+        (uint128 liquidity, uint256 last0, uint256 last1) =
+            POOL_MANAGER.getPositionInfo(id, address(this), tickLower, tickUpper, bytes32(0));
+        (uint256 inside0, uint256 inside1) = POOL_MANAGER.getFeeGrowthInside(id, tickLower, tickUpper);
+        unchecked {
+            // Wrap-around is expected, as in Position.update.
+            fees0 = FullMath.mulDiv(inside0 - last0, liquidity, FixedPoint128.Q128);
+            fees1 = FullMath.mulDiv(inside1 - last1, liquidity, FixedPoint128.Q128);
+        }
     }
 
     /// @dev Fees sent to this contract or to the PoolManager could never be spent (spec section 4.5 step 6).
