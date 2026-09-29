@@ -32,6 +32,8 @@ contract DeployLaunchpad is Script {
     uint256 internal constant ROBINHOOD_CHAIN_ID = 4663;
     address internal constant ROBINHOOD_POOL_MANAGER = 0x8366a39CC670B4001A1121B8F6A443A643e40951;
     address internal constant CANONICAL_PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    /// @dev USDG, the one currency priced as USD 1 without a feed.
+    address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     string internal constant CONFIG_PATH = "script/config/launch-currencies.json";
     /// @dev The app's own staleness window for Chainlink prices.
     uint256 internal constant MAX_FEED_AGE = 3 days;
@@ -114,16 +116,23 @@ contract DeployLaunchpad is Script {
         while (vm.keyExistsJson(json, string.concat(".currencies[", vm.toString(n), "]"))) {
             n++;
         }
+        require(n != 0, "the config has no currencies");
         c.rows = new Row[](n);
         for (uint256 i = 0; i < n; i++) {
             c.rows[i] = _parseRow(json, string.concat(".currencies[", vm.toString(i), "]"));
+            for (uint256 j = 0; j < i; j++) {
+                require(c.rows[j].quote != c.rows[i].quote, string.concat(c.rows[i].symbol, ": duplicate address"));
+            }
         }
     }
 
     /// @notice A row's USD price per whole token as an integer `answer` with `feedDecimals` decimals.
     function priceOf(Row memory row) public view returns (uint256 answer, uint8 feedDecimals) {
         bytes32 source = keccak256(bytes(row.priceSource));
-        if (source == keccak256("pinned")) return (1, 0);
+        if (source == keccak256("pinned")) {
+            require(row.quote == USDG, string.concat(row.symbol, ": priceSource pinned is only for the USDG address"));
+            return (1, 0);
+        }
         if (source == keccak256("chainlink")) {
             require(
                 row.chainlinkProxy != address(0),
@@ -168,7 +177,14 @@ contract DeployLaunchpad is Script {
         maxValuation = maxUsd * scale / answer;
     }
 
-    function _parseRow(string memory json, string memory at) internal pure returns (Row memory row) {
+    /// @notice The USD value of `raw` quote units for the printout, rounded up. A bound is rounded down from a whole
+    ///         USD amount, so rounding its value up reads that amount back: USD 5,000 prints 5,000, not 4,999.
+    function usdOf(uint256 raw, uint8 quoteDecimals, uint256 answer, uint8 feedDecimals) public pure returns (uint256) {
+        uint256 scale = 10 ** (uint256(quoteDecimals) + feedDecimals);
+        return (raw * answer + scale - 1) / scale;
+    }
+
+    function _parseRow(string memory json, string memory at) internal view returns (Row memory row) {
         row.quote = vm.parseJsonAddress(json, string.concat(at, ".address"));
         row.symbol = vm.parseJsonString(json, string.concat(at, ".symbol"));
         // ERC-20 and Chainlink decimals fit uint8 by definition; the script checks both against the chain.
@@ -179,6 +195,14 @@ contract DeployLaunchpad is Script {
         // forge-lint: disable-next-line(unsafe-typecast)
         row.chainlinkDecimals = uint8(vm.parseJsonUint(json, string.concat(at, ".chainlinkDecimals")));
         row.referenceUsdPrice = vm.parseUint(vm.parseJsonString(json, string.concat(at, ".referenceUsdPrice")));
+        // Optional in the schema; when present it must match the 8 decimals the script reads the price at.
+        string memory decimalsKey = string.concat(at, ".referencePriceDecimals");
+        if (vm.keyExistsJson(json, decimalsKey)) {
+            require(
+                vm.parseJsonUint(json, decimalsKey) == REFERENCE_DECIMALS,
+                string.concat(row.symbol, ": referencePriceDecimals must be 8")
+            );
+        }
     }
 
     /// @dev Every row priced, converted and checked before anything is broadcast, so a bad row stops the run
@@ -212,11 +236,11 @@ contract DeployLaunchpad is Script {
         console.log("SVLaunchpad deployed at:", address(launchpad));
         for (uint256 i = 0; i < config.rows.length; i++) {
             (uint256 answer, uint8 feedDecimals) = priceOf(config.rows[i]);
-            uint256 scale = 10 ** (uint256(config.rows[i].decimals) + feedDecimals);
+            uint8 quoteDecimals = config.rows[i].decimals;
             console.log(config.rows[i].symbol, config.rows[i].priceSource);
             console.log("  USD per token", answer, "with decimals", feedDecimals);
-            console.log("  min raw", mins[i], "USD", mins[i] * answer / scale);
-            console.log("  max raw", maxs[i], "USD", maxs[i] * answer / scale);
+            console.log("  min raw", mins[i], "USD", usdOf(mins[i], quoteDecimals, answer, feedDecimals));
+            console.log("  max raw", maxs[i], "USD", usdOf(maxs[i], quoteDecimals, answer, feedDecimals));
         }
         console.log("  owner now:      ", launchpad.owner());
         console.log("  pending owner:  ", launchpad.pendingOwner());
