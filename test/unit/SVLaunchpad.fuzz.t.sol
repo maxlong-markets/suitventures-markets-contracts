@@ -32,7 +32,7 @@ contract SVLaunchpadFuzzTest is SVLaunchpadTestBase {
         (address token, address quote) = tokenFirst ? (LOW, HIGH) : (HIGH, LOW);
         Expected memory e = _expected(token, quote, valuation);
         assertLe(e.snapped, valuation, "V' <= V, exactly");
-        assertGe(e.snapped * 10_202, valuation * 10_000, "V' x 1.0202 >= V");
+        assertGe(e.snapped * 10_202_004, valuation * 10_000_000, "V' x 1.0202004 >= V, above 1.0001^200");
         assertEq(e.openTick % 200, 0, "a multiple of the spacing");
         assertGt(e.openTick, MIN_USABLE_TICK, "strictly inside the usable range, bottom");
         assertLt(e.openTick, MAX_USABLE_TICK, "strictly inside the usable range, top");
