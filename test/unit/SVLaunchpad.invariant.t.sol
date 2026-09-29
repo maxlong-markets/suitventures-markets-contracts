@@ -157,8 +157,8 @@ contract LaunchpadFeesHandler is Test {
 /// @notice Spec sections 4.6 and 8.1, invariant: per currency, the launchpad's balance equals the sum of `owed`,
 ///         through collections, failed deliveries and claims in random order, including a fee-on-transfer quote;
 ///         and after launch no sequence of calls changes the position's liquidity. Every run starts with a
-///         share already credited to the refused payout; `afterInvariant` checks that, and a unit test drives the
-///         credit-then-claim path deterministically.
+///         share already credited to the refused payout; `afterInvariant` requires each run to have made at least
+///         one successful claim, and a unit test drives the credit-then-claim path deterministically.
 contract SVLaunchpadInvariantTest is SVLaunchpadTestBase {
     LaunchpadFeesHandler internal handler;
     MockQuirkyERC20 internal q;
@@ -215,10 +215,14 @@ contract SVLaunchpadInvariantTest is SVLaunchpadTestBase {
         assertEq(_positionLiquidity(token), stored, "the position's liquidity changed after launch");
     }
 
-    /// @dev Runs after each invariant run: the run carried a credited share. Claims are proved deterministically
-    ///      by the unit test below, not per run, so a random sequence without a claim is not a failure.
+    /// @dev Runs after each invariant run. The first check is only the setUp sanity check: setUp's own collection
+    ///      credits the refused payout, so it holds by construction and proves nothing about the random sequence.
+    ///      The second is what the random sequence must earn: every run starts with the creator owed and the claim
+    ///      action pays a never-refusing rescue address, so a run without a successful claim means the claim path
+    ///      went unexercised and the balance-equals-owed check never saw a claim.
     function afterInvariant() external view {
-        assertGt(handler.creditingCollections(), 0, "a collection credited a refused share to owed");
+        assertGe(handler.creditingCollections(), 1, "setUp sanity: its collection credited the refused payout");
+        assertGt(handler.claims(), 0, "the random sequence made at least one successful claim");
     }
 
     /// @dev The handler's two interesting paths, driven in a fixed order: a collection with the payout refused
