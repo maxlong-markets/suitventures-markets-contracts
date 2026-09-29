@@ -13,8 +13,9 @@ evm_version = "cancun"
 optimizer = true
 optimizer_runs = 1_000_000
 via_ir = false
-# No file-system access for tests or scripts: nothing here reads or writes files.
-fs_permissions = []
+# One read-only permission: the launchpad deploy script reads its per-currency config (spec section 8.3).
+# Nothing reads anything else, and nothing writes.
+fs_permissions = [{ access = "read", path = "./script/config" }]
 # Only remappings.txt applies; the nested lib/ trees of the dependencies are ignored so that
 # every import of a Uniswap type resolves to exactly one copy (the pinned root submodule).
 auto_detect_remappings = false

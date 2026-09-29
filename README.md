@@ -1,4 +1,4 @@
-# SVRouter
+# SuitVentures contracts: SVRouter and SVLaunchpad
 
 The LongMarkets trade router on Robinhood Chain (chain id 4663). One contract, `SVRouter`, is the only way the
 app trades: it pulls the input token from the user through Permit2, keeps the router fee for the SuitVentures fee
@@ -55,12 +55,103 @@ The public RPC serves only recent state, and the window varies (a pinned block w
 
 **Not done on purpose:** no deployment, no Blockscout verification, no GitHub remote, no frontend wiring. All of that starts after your review.
 
+## SVLaunchpad
+
+The MaxLong Markets instant launchpad. One transaction, signed by a holder of the Suits NFT, deploys a token of
+one billion supply with no owner, opens its Uniswap v4 pool at the valuation the creator picks, and places the
+whole supply in one position from that price to the end of the price range. The launchpad owns the position and
+has no code that can take liquidity out of it. The creator may buy first with their own money, up to 20 % of the
+supply. Anyone can collect the trading fees: 70 % go to the launch's payout address and 30 % to the fee wallet.
+A share the currency refuses to deliver waits in the contract until its owner claims it.
+
+- Binding spec: frontend repo, `docs/superpowers/specs/2026-09-28-instant-launchpad-design.md`, sections 3 and 4
+- Plan: [`docs/superpowers/plans/2026-09-29-instant-launchpad-contracts.md`](docs/superpowers/plans/2026-09-29-instant-launchpad-contracts.md)
+
+**How to review.** Read the spec's sections 3 and 4, then `src/interfaces/ISVLaunchpad.sol`, then
+`src/SVLaunchpad.sol` from `launch` down; the step numbers in its comments are the spec's. Then the tests in this
+order: `SVLaunchpad.launch.t.sol`, `SVLaunchpad.fees.t.sol`, `SVLaunchpad.invariant.t.sol`,
+`SVLaunchpad.fuzz.t.sol`, `test/fork/SVLaunchpadFork.t.sol`.
+
+**Run it yourself:**
+
+```sh
+forge build --sizes --skip test --skip script
+forge test --no-match-path 'test/fork/*'
+FOUNDRY_PROFILE=coverage forge coverage --report summary --no-match-path 'test/fork/*'
+ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com ROBINHOOD_FORK_BLOCK=<a recent block> \
+  forge test --match-path 'test/fork/SVLaunchpadFork.t.sol' -vv
+```
+
+The size check skips tests and scripts because the PoolManager the tests deploy is larger than the limit. The
+coverage profile clears the per-file compiler setting, which coverage builds cannot use.
+
+Set `ROBINHOOD_FORK_BLOCK` to a recent block for the fork run. The public node keeps state for only about an hour,
+so the block pinned in the fork test ages out soon after it is set. `cast block-number --rpc-url robinhood` prints
+the head; a block a few hundred below it works.
+
+| Fact | Value |
+|---|---|
+| `SVLaunchpad` runtime size at 1,000,000 optimizer runs | 31,328 bytes, over the 24,576-byte limit |
+| `SVLaunchpad` runtime size as built | 24,300 bytes at 200 optimizer runs, 276 under the limit |
+| `SVLaunchToken` runtime size | 1,969 bytes as built at 200 runs, 2,558 bytes at 1,000,000 runs |
+| `SVRouter` runtime size | 7,647 bytes, unchanged |
+| Gas of a launch with a first buy | 1,138,477 in the unit suite, normal build |
+| Fork run | 2 of 2 passed at block 75,238,414 on the public node |
+| Quoter against the launched pool on the fork | exact to the unit |
+| `uncollectedFees` against StateView on the fork | equal |
+| Deployed pool protocol fee at the fork block | 0 at block 75,238,414 |
+| PoolManager protocol fee controller | `0x6d0009504D129CF5002Dba61D9Ae8575AA79314c` |
+
+**Currencies.** The deploy script reads `script/config/launch-currencies.json`. The frontend script
+`scripts/launch/currency-config.mts` writes it from `quotes.json`; `script/config/launch-currencies.example.json`
+shows the shape. Each row names its `priceSource`:
+
+| priceSource | Price used | Refused when |
+|---|---|---|
+| `pinned` | USD 1, for USDG | never |
+| `chainlink` | the proxy's latest answer | older than 3 days, dated in the future, not above zero, or `chainlinkDecimals` not the feed's |
+| `reference` | `referenceUsdPrice`, an integer with 8 decimals: `"2500000000"` is USD 25 | `"0"`, that is not filled in, or outside USD 0.01 to 100,000 per token |
+
+Fill `referenceUsdPrice` on every `reference` row before deploying; the script names each row it refuses. Bounds
+are `minUsd` and `maxUsd` converted to raw units at that price, rounded down, and must lie between `1e8` and
+`1e36` raw units. The printout shows each row's price per token with its decimals, its raw bounds and their USD
+value, then the settings read back.
+
+`creationFee` is one raw amount applied to every currency. It is `"0"` today. Once it is not zero it means very
+different money in different currencies: `"1000000"` is USD 1 of USDG, which has 6 decimals, but a millionth of a
+millionth of a token in an 18-decimal stock. A non-zero creation fee therefore needs a value per currency, set
+with `setCurrency`, not this single field.
+
+**Deploy, after Kobe's review.** Dry run against a local anvil fork of chain 4663, then:
+
+```sh
+forge script script/DeployLaunchpad.s.sol --rpc-url robinhood --account <keystore name> --broadcast
+```
+
+The broadcaster deploys with itself as owner, allows every currency, then transfers ownership to `OWNER`. When
+`OWNER` is another key, it must call `acceptOwnership`. Verify through Sourcify with the constructor arguments
+PoolManager, Permit2, the broadcaster, `FEE_WALLET` and `LAUNCHER_GATE`, and with the optimizer runs the launch
+profile in `foundry.toml` sets, 200:
+
+```sh
+forge verify-contract <address> src/SVLaunchpad.sol:SVLaunchpad --chain-id 4663 --verifier sourcify \
+  --optimizer-runs 200 \
+  --constructor-args "$(cast abi-encode 'constructor(address,address,address,address,address)' \
+    0x8366a39CC670B4001A1121B8F6A443A643e40951 0x000000000022D473030F116dDEE9F6B43aC78BA3 \
+    <broadcaster> "$FEE_WALLET" "$LAUNCHER_GATE")"
+```
+
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `src/SVRouter.sol` | the contract |
 | `src/interfaces/ISVRouter.sol` | `SwapParams`, events, errors, external functions (spec section 3) |
+| `src/SVLaunchpad.sol` | the instant launchpad |
+| `src/SVLaunchToken.sol` | the token every launch deploys |
+| `src/interfaces/ISVLaunchpad.sol` | the launchpad's structs, events, errors, external functions (spec section 4.2) |
+| `script/DeployLaunchpad.s.sol` | deploys the launchpad and allows the config's currencies; not run before review |
+| `script/config/` | the launchpad's currency config; the only path any script may read |
 | `script/Deploy.s.sol` | deploys from environment variables, prints the address; not run before review |
 | `test/unit/` | unit tests, no network: the real Permit2 bytecode, mocks for the Universal Router and the tokens |
 | `test/fork/` | fork tests against Robinhood Chain, skipped when `ROBINHOOD_RPC_URL` is unset |
@@ -97,6 +188,8 @@ Copy `.env.example` to `.env` (git-ignored). Placeholders only in the example; n
 | `UNIVERSAL_ROUTER` | deploy script | `0x06AfBA43Fd06227fA663b0DAecF536f6EaA6bf99`, the current Universal Router (D38) |
 | `PERMIT2` | deploy script | `0x000000000022D473030F116dDEE9F6B43aC78BA3`, the canonical Permit2 |
 | `ALLOW_OTHER_ADDRESSES` | deploy script | `true` lets the script deploy against a router or Permit2 other than the two constants above; unset otherwise |
+| `LAUNCHER_GATE` | launchpad deploy script | the ERC-721 whose holders may launch: the Suits NFT; zero lets anyone launch |
+| `POOL_MANAGER` | launchpad deploy script | optional; `0x8366a39CC670B4001A1121B8F6A443A643e40951` when unset |
 
 The deployer key is never an environment variable: pass it to forge with `--account`, `--ledger` or
 `--interactive`.
