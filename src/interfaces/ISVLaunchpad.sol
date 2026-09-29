@@ -169,4 +169,91 @@ interface ISVLaunchpad {
     error NotPoolManager();
     /// @notice `unlockCallback` arrived while the launchpad had no unlock in flight.
     error UnexpectedCallback();
+
+    // -------------------------------------------------------------------------------------------------------
+    // Owner only
+    // -------------------------------------------------------------------------------------------------------
+
+    /// @notice Owner only. The wallet that receives the router fee, the creation fee and the platform's share of
+    ///         collected fees; non-zero, never this contract or the PoolManager. Read at every collection, so a
+    ///         change applies to every launch.
+    function setFeeWallet(address wallet) external;
+
+    /// @notice Owner only. The router fee taken out of the first buy, in basis points; at most 50.
+    function setRouterFee(uint16 bps) external;
+
+    /// @notice Owner only. The payout's share of collected fees, fixed into each launch at launch time.
+    function setCreatorShare(uint16 bps) external;
+
+    /// @notice Owner only. The first buy's cap in basis points of the supply; 0 blocks any first buy.
+    function setFirstBuyCap(uint16 bps) external;
+
+    /// @notice Owner only. Launches per wallet per UTC day; 0 stops new launches and is the only pause.
+    function setDailyLaunchLimit(uint8 limit) external;
+
+    /// @notice Owner only. The ERC-721 whose holders may launch; zero means anyone.
+    function setLauncherGate(address gate) external;
+
+    /// @notice Owner only. The hook of later launches' pools: zero, or a hook as spec section 4.9 requires.
+    function setHook(address hook) external;
+
+    /// @notice Owner only. Allow a quote currency with valuation bounds and a creation fee; `maxValuation == 0`
+    ///         disallows it and clears the row.
+    function setCurrency(address quote, uint256 minValuation, uint256 maxValuation, uint256 creationFee) external;
+
+    // -------------------------------------------------------------------------------------------------------
+    // Views
+    // -------------------------------------------------------------------------------------------------------
+
+    /// @notice The token address a launch by `creator` with this salt, name and symbol would deploy.
+    function predictToken(address creator, bytes32 salt, string calldata name, string calldata symbol)
+        external
+        view
+        returns (address);
+
+    /// @notice The snapped opening of spec section 3.2 for a token and quote pair at a requested valuation.
+    function openingFor(address token, address quote, uint256 valuation)
+        external
+        pure
+        returns (int24 openTick, uint160 sqrtPriceX96, uint256 snappedValuation);
+
+    /// @notice Whether `account` may launch under the current gate, by the fail-closed rule of section 4.7.
+    function isAllowedLauncher(address account) external view returns (bool);
+
+    /// @notice The bounds and creation fee of a quote currency; all zeros when not allowed.
+    function currency(address quote) external view returns (CurrencyConfig memory);
+
+    /// @notice How many launches have been made.
+    function launchCount() external view returns (uint256);
+
+    /// @notice The wallet that receives the router fee, the creation fee and the platform's fee share.
+    function feeWallet() external view returns (address);
+
+    /// @notice The router fee on first buys, in basis points.
+    function routerFeeBps() external view returns (uint16);
+
+    /// @notice The payout's share of collected fees for launches made from now on, in basis points.
+    function creatorShareBps() external view returns (uint16);
+
+    /// @notice The first buy's cap in basis points of the supply.
+    function firstBuyCapBps() external view returns (uint16);
+
+    /// @notice Launches per wallet per UTC day.
+    function dailyLaunchLimit() external view returns (uint8);
+
+    /// @notice The ERC-721 whose holders may launch; zero means anyone.
+    function launcherGate() external view returns (address);
+
+    /// @notice The hook later launches' pools get; zero means hookless.
+    function hook() external view returns (address);
+
+    /// @notice The Uniswap v4 PoolManager.
+    // The name is fixed by the spec (section 4.2).
+    // forge-lint: disable-next-line(mixed-case-function)
+    function POOL_MANAGER() external view returns (IPoolManager);
+
+    /// @notice Permit2, which pulls the first buy and the creation fee against the creator's signature.
+    // The name is fixed by the spec (section 4.2).
+    // forge-lint: disable-next-line(mixed-case-function)
+    function PERMIT2() external view returns (ISignatureTransfer);
 }
