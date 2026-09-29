@@ -4,14 +4,22 @@ pragma solidity 0.8.26;
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {TransientSlot} from "@openzeppelin/contracts/utils/TransientSlot.sol";
 import {Create2} from "@openzeppelin/contracts/utils/Create2.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 import {ISignatureTransfer} from "permit2/src/interfaces/ISignatureTransfer.sol";
 import {ISVLaunchpad} from "./interfaces/ISVLaunchpad.sol";
 import {SVLaunchToken} from "./SVLaunchToken.sol";
@@ -28,6 +36,8 @@ import {SVLaunchToken} from "./SVLaunchToken.sol";
 ///      Fee-on-transfer and rebasing quotes fail closed at launch and are split on what arrived at collection.
 contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     using Hooks for IHooks;
+    using SafeERC20 for IERC20;
+    using TransientSlot for *;
 
     // -------------------------------------------------------------------------------------------------------
     // Constants (spec section 4.3)
@@ -63,6 +73,10 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     uint16 private constant INITIAL_CREATOR_SHARE_BPS = 7_000;
     uint16 private constant INITIAL_FIRST_BUY_CAP_BPS = 2_000;
     uint8 private constant INITIAL_DAILY_LAUNCH_LIMIT = 5;
+    /// @dev The transient "unlock in flight" flag read by `unlockCallback` (spec section 4.4), at the ERC-7201
+    ///      slot of the namespace "svlaunchpad.unlocking".
+    bytes32 private constant UNLOCKING_SLOT =
+        keccak256(abi.encode(uint256(keccak256("svlaunchpad.unlocking")) - 1)) & ~bytes32(uint256(0xff));
 
     // -------------------------------------------------------------------------------------------------------
     // Immutables
@@ -81,6 +95,49 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     struct DayCount {
         uint64 day;
         uint8 count;
+    }
+
+    /// @dev Which operation an unlock carries (spec section 4.2).
+    enum Action {
+        Launch,
+        Collect
+    }
+
+    /// @dev The Action.Launch payload, exactly these fields (spec section 4.2).
+    struct LaunchCallback {
+        PoolKey key;
+        int24 tickLower;
+        int24 tickUpper;
+        address token;
+        address quote;
+        bool tokenIsCurrency0;
+        uint256 net; // firstBuy minus routerFee; 0 without a first buy
+        address creator; // msg.sender of launch; receives the first-buy tokens
+        uint256 minFirstBuyTokens;
+    }
+
+    /// @dev What the launch callback returns (spec section 4.2).
+    struct LaunchResult {
+        uint128 liquidity;
+        uint256 owed;
+        uint256 tokensOut;
+    }
+
+    /// @dev The working values of one launch, in memory so `launch` stays within the stack the legacy code
+    ///      generator allows (via-IR is off by design, as in SVRouter).
+    struct LaunchState {
+        address token;
+        address quote;
+        address payout;
+        bool tokenIsCurrency0;
+        int24 openTick;
+        uint160 sqrtPriceX96;
+        uint256 openingValuation;
+        uint256 routerFee;
+        uint256 creationFee;
+        uint256 net;
+        PoolKey key;
+        LaunchResult result;
     }
 
     /// @inheritdoc ISVLaunchpad
@@ -144,6 +201,244 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
         emit DailyLaunchLimitChanged(INITIAL_DAILY_LAUNCH_LIMIT);
         emit LauncherGateChanged(launcherGate_);
         emit HookChanged(address(0));
+    }
+
+    // -------------------------------------------------------------------------------------------------------
+    // launch (spec section 4.5)
+    // -------------------------------------------------------------------------------------------------------
+
+    /// @inheritdoc ISVLaunchpad
+    /// @dev Steps in the spec's order: every cheap check before any transfer, and the payment before the
+    ///      deployment, so a failed permit wastes no deployment gas. No native path: every quote is an ERC-20 on
+    ///      the owner's allowlist. The position is owned by this contract, and no function here can decrease its
+    ///      liquidity: that is the lock.
+    function launch(
+        LaunchParams calldata p,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) external nonReentrant returns (address token) {
+        // 1.
+        if (block.timestamp > p.deadline) revert Expired();
+        // 2.
+        if (!isAllowedLauncher(msg.sender)) revert NotAllowedToLaunch();
+        // 3.
+        _countLaunch(msg.sender);
+        // 4.
+        _checkText(p);
+        // 5.
+        CurrencyConfig memory c = _currencies[p.quote];
+        if (c.maxValuation == 0) revert CurrencyNotAllowed();
+        if (p.valuation < c.minValuation || p.valuation > c.maxValuation) {
+            revert ValuationOutOfRange(p.valuation, c.minValuation, c.maxValuation);
+        }
+        LaunchState memory s;
+        s.quote = p.quote;
+        // 6.
+        s.payout = p.payout == address(0) ? msg.sender : p.payout;
+        _checkPayout(s.payout);
+        // 7. The router fee comes out of the first buy exactly as SVRouter takes it.
+        s.routerFee = p.firstBuy * routerFeeBps / BPS;
+        s.net = p.firstBuy - s.routerFee;
+        s.creationFee = c.creationFee;
+        _pull(p.quote, p.firstBuy + c.creationFee, permit, signature);
+        // 8.
+        s.token = address(new SVLaunchToken{salt: _salt(msg.sender, p.salt)}(p.name, p.symbol, address(this)));
+        // 9.
+        s.tokenIsCurrency0 = s.token < p.quote;
+        (s.openTick, s.sqrtPriceX96, s.openingValuation) = _opening(s.token, p.quote, p.valuation);
+        s.key = _key(s.token, p.quote, hook);
+        // 10. A key someone initialised first reverts PoolAlreadyInitialized here (spec section 4.10).
+        POOL_MANAGER.initialize(s.key, s.sqrtPriceX96);
+        // 11.
+        s.result = _unlockLaunch(s, p.minFirstBuyTokens);
+        // 12. to 14.
+        _finishLaunch(s, p);
+        return s.token;
+    }
+
+    /// @inheritdoc ISVLaunchpad
+    /// @dev Only the PoolManager may call this, and only while `_unlock` has a call in flight: the transient flag
+    ///      is what stops an unlock started by someone else from reaching the position code. Not `nonReentrant`:
+    ///      it runs inside the guarded `launch`.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(POOL_MANAGER)) revert NotPoolManager();
+        if (!UNLOCKING_SLOT.asBoolean().tload()) revert UnexpectedCallback();
+        (, LaunchCallback memory cb) = abi.decode(data, (Action, LaunchCallback));
+        return _launchCallback(cb);
+    }
+
+    /// @dev Step 3: `block.timestamp / 1 days` is the UTC day number; a new day restarts the count at zero.
+    function _countLaunch(address account) private {
+        // The day number fits 64 bits for billions of years.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 day = uint64(block.timestamp / 1 days);
+        DayCount memory d = _days[account];
+        uint8 count = d.day == day ? d.count : 0;
+        if (count >= dailyLaunchLimit) revert DailyLimitReached();
+        _days[account] = DayCount({day: day, count: count + 1});
+    }
+
+    /// @dev Step 4: lengths in bytes, not characters.
+    function _checkText(LaunchParams calldata p) private pure {
+        uint256 nameLength = bytes(p.name).length;
+        if (nameLength == 0 || nameLength > MAX_NAME_BYTES) revert BadName();
+        uint256 symbolLength = bytes(p.symbol).length;
+        if (symbolLength == 0 || symbolLength > MAX_SYMBOL_BYTES) revert BadSymbol();
+        if (bytes(p.metadataUri).length > MAX_URI_BYTES) revert UriTooLong();
+    }
+
+    /// @dev Step 7. Nothing is pulled for a free launch, so it needs no approval and no signature. Otherwise the
+    ///      pull is measured: this contract can hold credited `owed` balances between transactions, so a
+    ///      fee-on-transfer quote must never be able to pay part of a launch out of them.
+    function _pull(
+        address quote,
+        uint256 total,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) private {
+        if (total == 0) return;
+        if (permit.permitted.token != quote || permit.permitted.amount < total) revert PermitMismatch();
+        uint256 before = IERC20(quote).balanceOf(address(this));
+        PERMIT2.permitTransferFrom(
+            permit,
+            ISignatureTransfer.SignatureTransferDetails({to: address(this), requestedAmount: total}),
+            msg.sender,
+            signature
+        );
+        if (IERC20(quote).balanceOf(address(this)) - before != total) revert PermitMismatch();
+    }
+
+    /// @dev Sets the in-flight flag around the PoolManager's `unlock`, which calls back into `unlockCallback`.
+    function _unlock(bytes memory data) private returns (bytes memory result) {
+        UNLOCKING_SLOT.asBoolean().tstore(true);
+        result = POOL_MANAGER.unlock(data);
+        UNLOCKING_SLOT.asBoolean().tstore(false);
+    }
+
+    /// @dev Step 11: the payload is built field by field, which keeps this frame within the stack.
+    function _unlockLaunch(LaunchState memory s, uint256 minFirstBuyTokens) private returns (LaunchResult memory) {
+        LaunchCallback memory cb;
+        cb.key = s.key;
+        (cb.tickLower, cb.tickUpper) = _range(s.tokenIsCurrency0, s.openTick);
+        cb.token = s.token;
+        cb.quote = s.quote;
+        cb.tokenIsCurrency0 = s.tokenIsCurrency0;
+        cb.net = s.net;
+        cb.creator = msg.sender;
+        cb.minFirstBuyTokens = minFirstBuyTokens;
+        return abi.decode(_unlock(abi.encode(Action.Launch, cb)), (LaunchResult));
+    }
+
+    /// @dev Steps 11.2 to 11.7. The mint charges only the token: the pool sits exactly on the position's lower
+    ///      edge when the token is currency0 and on its upper edge when it is currency1 (spec section 3.3). The
+    ///      quote side of the mint is zero by that maths and is never settled, so were it not, the unlock would
+    ///      revert `CurrencyNotSettled`; likewise the quote is settled with exactly `net`, so a partial fill
+    ///      cannot pass silently.
+    function _launchCallback(LaunchCallback memory cb) private returns (bytes memory) {
+        LaunchResult memory r;
+        // 2.
+        r.liquidity = _liquidityFor(cb.tokenIsCurrency0, cb.tokenIsCurrency0 ? cb.tickLower : cb.tickUpper);
+        (BalanceDelta delta,) = POOL_MANAGER.modifyLiquidity(
+            cb.key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: cb.tickLower,
+                tickUpper: cb.tickUpper,
+                liquidityDelta: int256(uint256(r.liquidity)),
+                salt: bytes32(0)
+            }),
+            ""
+        );
+        // A fresh position's token delta is negative and far above type(int128).min, so its negation is a
+        // positive int128 that fits uint128 and uint256 unchanged.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        r.owed = uint256(uint128(-(cb.tokenIsCurrency0 ? delta.amount0() : delta.amount1())));
+        // 3.
+        if (cb.net > 0) r.tokensOut = _firstBuy(cb);
+        uint256 cap = SUPPLY * firstBuyCapBps / BPS;
+        if (r.tokensOut > cap) revert FirstBuyTooLarge(r.tokensOut, cap);
+        if (r.tokensOut < cb.minFirstBuyTokens) revert FirstBuyTooSmall(r.tokensOut, cb.minFirstBuyTokens);
+        // 4.
+        _pay(cb.token, r.owed);
+        // 5.
+        if (cb.net > 0) _pay(cb.quote, cb.net);
+        // 6. Inside the callback msg.sender is the PoolManager, so the payload carries the creator.
+        if (r.tokensOut > 0) POOL_MANAGER.take(Currency.wrap(cb.token), cb.creator, r.tokensOut);
+        // 7.
+        return abi.encode(r);
+    }
+
+    /// @dev Step 11.3: exact input `net` of the quote for the token, with the price limit at the far end because
+    ///      the position covers it. The pool's 1 % fee accrues to this launch's own position.
+    function _firstBuy(LaunchCallback memory cb) private returns (uint256 tokensOut) {
+        BalanceDelta delta = POOL_MANAGER.swap(
+            cb.key,
+            IPoolManager.SwapParams({
+                zeroForOne: !cb.tokenIsCurrency0,
+                // `net` was pulled from the creator, so it is far below 2^255.
+                // forge-lint: disable-next-line(unsafe-typecast)
+                amountSpecified: -int256(cb.net),
+                sqrtPriceLimitX96: cb.tokenIsCurrency0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1
+            }),
+            ""
+        );
+        // The token side of an exact-input buy is the non-negative output.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        tokensOut = uint256(uint128(cb.tokenIsCurrency0 ? delta.amount0() : delta.amount1()));
+    }
+
+    /// @dev Pays exactly `amount` of `currency_` into the PoolManager: `sync`, transfer, `settle`.
+    function _pay(address currency_, uint256 amount) private {
+        POOL_MANAGER.sync(Currency.wrap(currency_));
+        IERC20(currency_).safeTransfer(address(POOL_MANAGER), amount);
+        POOL_MANAGER.settle();
+    }
+
+    /// @dev Steps 12 to 14, apart from `launch` to keep it within the stack. The fee transfer is part of the
+    ///      launch, so a fee wallet that refuses it stops paid launches until the owner changes it; nothing
+    ///      already launched is affected.
+    function _finishLaunch(LaunchState memory s, LaunchParams calldata p) private {
+        // 12.
+        uint256 fees = s.routerFee + s.creationFee;
+        if (fees > 0) IERC20(s.quote).safeTransfer(feeWallet, fees);
+        // 13. What the pool did not take; afterwards this contract holds none of the token.
+        uint256 dust = SUPPLY - s.result.owed;
+        if (dust > 0) SVLaunchToken(s.token).burn(dust);
+        // 14.
+        Launch storage l = _launches[s.token];
+        l.creator = msg.sender;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        l.launchedAt = uint64(block.timestamp);
+        l.creatorShareBps = creatorShareBps;
+        l.tokenIsCurrency0 = s.tokenIsCurrency0;
+        l.payout = s.payout;
+        l.openTick = s.openTick;
+        l.quote = s.quote;
+        l.hook = address(s.key.hooks);
+        l.liquidity = s.result.liquidity;
+        launchCount += 1;
+        _emitLaunched(s, p);
+    }
+
+    /// @dev The event payload is filled field by field: a sixteen-field struct literal exceeds the stack.
+    function _emitLaunched(LaunchState memory s, LaunchParams calldata p) private {
+        LaunchedData memory d;
+        d.poolId = PoolId.unwrap(s.key.toId());
+        d.payout = s.payout;
+        d.hook = address(s.key.hooks);
+        d.tokenIsCurrency0 = s.tokenIsCurrency0;
+        d.openTick = s.openTick;
+        d.openingValuation = s.openingValuation;
+        d.liquidity = s.result.liquidity;
+        d.tokensInPool = s.result.owed;
+        d.firstBuyIn = s.net;
+        d.firstBuyTokens = s.result.tokensOut;
+        d.routerFee = s.routerFee;
+        d.creationFee = s.creationFee;
+        d.creatorShareBps = creatorShareBps;
+        d.name = p.name;
+        d.symbol = p.symbol;
+        d.metadataUri = p.metadataUri;
+        emit Launched(s.token, msg.sender, s.quote, d);
     }
 
     // -------------------------------------------------------------------------------------------------------
@@ -248,6 +543,18 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     // -------------------------------------------------------------------------------------------------------
 
     /// @inheritdoc ISVLaunchpad
+    function getLaunch(address token) external view returns (Launch memory) {
+        return _launches[token];
+    }
+
+    /// @inheritdoc ISVLaunchpad
+    /// @dev The key is never stored: the order, the fee and spacing constants and the stored hook give it.
+    function poolKeyOf(address token) external view returns (PoolKey memory) {
+        Launch memory l = _launchOf(token);
+        return _key(token, l.quote, l.hook);
+    }
+
+    /// @inheritdoc ISVLaunchpad
     /// @dev The same read as SVRouter's Suits check with the opposite failure rule: a raw static call with a gas
     ///      allowance, and the account counts only when the call succeeds, the reply is exactly one word and that
     ///      word is above zero. A codeless gate, a revert, a short reply or a gas-burning gate all mean not
@@ -258,6 +565,12 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
         (bool ok, bytes memory reply) =
             gate.staticcall{gas: GATE_CHECK_GAS}(abi.encodeCall(IERC721.balanceOf, (account)));
         return ok && reply.length == 32 && abi.decode(reply, (uint256)) > 0;
+    }
+
+    /// @inheritdoc ISVLaunchpad
+    function launchesToday(address account) external view returns (uint256) {
+        DayCount memory d = _days[account];
+        return d.day == block.timestamp / 1 days ? d.count : 0;
     }
 
     /// @inheritdoc ISVLaunchpad
@@ -329,6 +642,38 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
         snapped = tokenFirst
             ? FullMath.mulDiv(FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 64), SUPPLY, 1 << 128)
             : FullMath.mulDiv(FullMath.mulDiv(SUPPLY, 1 << 96, sqrtPriceX96), 1 << 96, sqrtPriceX96);
+    }
+
+    /// @dev Spec section 3.3, rounded down: liquidity for the whole supply from the opening price to the far end.
+    function _liquidityFor(bool tokenIsCurrency0, int24 openTick) private pure returns (uint128) {
+        uint160 sqrtOpen = TickMath.getSqrtPriceAtTick(openTick);
+        return tokenIsCurrency0
+            ? LiquidityAmounts.getLiquidityForAmount0(sqrtOpen, TickMath.getSqrtPriceAtTick(MAX_USABLE_TICK), SUPPLY)
+            : LiquidityAmounts.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(MIN_USABLE_TICK), sqrtOpen, SUPPLY);
+    }
+
+    /// @dev The lower address is currency0; fee and spacing are constants; the hook is the launch's.
+    function _key(address token, address quote, address hook_) private pure returns (PoolKey memory) {
+        (address c0, address c1) = token < quote ? (token, quote) : (quote, token);
+        return PoolKey({
+            currency0: Currency.wrap(c0),
+            currency1: Currency.wrap(c1),
+            fee: POOL_FEE,
+            tickSpacing: TICK_SPACING,
+            hooks: IHooks(hook_)
+        });
+    }
+
+    /// @dev Spec section 3.3: from the opening tick to the top when the token is currency0, from the bottom to
+    ///      the opening tick when it is currency1.
+    function _range(bool tokenIsCurrency0, int24 openTick) private pure returns (int24 tickLower, int24 tickUpper) {
+        return tokenIsCurrency0 ? (openTick, MAX_USABLE_TICK) : (MIN_USABLE_TICK, openTick);
+    }
+
+    /// @dev A launch exists when its creator is non-zero (spec section 4.4).
+    function _launchOf(address token) private view returns (Launch memory l) {
+        l = _launches[token];
+        if (l.creator == address(0)) revert UnknownLaunch();
     }
 
     /// @dev Fees sent to this contract or to the PoolManager could never be spent (spec section 4.5 step 6).

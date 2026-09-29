@@ -18,6 +18,12 @@ fs_permissions = []
 # Only remappings.txt applies; the nested lib/ trees of the dependencies are ignored so that
 # every import of a Uniswap type resolves to exactly one copy (the pinned root submodule).
 auto_detect_remappings = false
+# SVLaunchpad embeds SVLaunchToken's creation code for its CREATE2 deployment, which puts it over the EIP-170
+# limit of 24,576 bytes at 1,000,000 optimizer runs. The two launch sources are compiled at 200 runs instead;
+# every other file, SVRouter included, keeps the setting above, so SVRouter's bytecode is unchanged. Launched
+# tokens and the launchpad therefore verify with --optimizer-runs 200.
+additional_compiler_profiles = [{ name = "launchpad", optimizer_runs = 200 }]
+compilation_restrictions = [{ paths = "src/SVLaunch*.sol", optimizer_runs = 200 }]
 
 [rpc_endpoints]
 robinhood = "${ROBINHOOD_RPC_URL}"
@@ -35,3 +41,9 @@ single_line_statement_blocks = "preserve"
 override_spacing = false
 wrap_comments = false
 ignore = []
+
+# Coverage builds are unoptimised and cannot honour a per-file compiler restriction, so this profile clears
+# both keys. Run coverage as: FOUNDRY_PROFILE=coverage forge coverage --report summary --no-match-path 'test/fork/*'
+[profile.coverage]
+additional_compiler_profiles = []
+compilation_restrictions = []

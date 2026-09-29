@@ -171,6 +171,24 @@ interface ISVLaunchpad {
     error UnexpectedCallback();
 
     // -------------------------------------------------------------------------------------------------------
+    // Anyone
+    // -------------------------------------------------------------------------------------------------------
+
+    /// @notice Launch a token: deploy it, open its pool at the snapped valuation, place the whole supply, and buy
+    ///         the creator a first allocation when `p.firstBuy > 0`. The permit and signature are ignored when
+    ///         `p.firstBuy` plus the creation fee is zero.
+    /// @return token The new token.
+    function launch(
+        LaunchParams calldata p,
+        ISignatureTransfer.PermitTransferFrom calldata permit,
+        bytes calldata signature
+    ) external returns (address token);
+
+    /// @notice The PoolManager only, during the launchpad's own unlock. Returns abi.encode(LaunchResult) for
+    ///         Action.Launch and abi.encode(uint256 tokenFees, uint256 quoteFees) for Action.Collect.
+    function unlockCallback(bytes calldata data) external returns (bytes memory);
+
+    // -------------------------------------------------------------------------------------------------------
     // Owner only
     // -------------------------------------------------------------------------------------------------------
 
@@ -205,6 +223,12 @@ interface ISVLaunchpad {
     // Views
     // -------------------------------------------------------------------------------------------------------
 
+    /// @notice One launch as stored; an empty struct (zero `creator`) when the token was not launched here.
+    function getLaunch(address token) external view returns (Launch memory);
+
+    /// @notice The pool key of a launch; reverts `UnknownLaunch` for a token not launched here.
+    function poolKeyOf(address token) external view returns (PoolKey memory);
+
     /// @notice The token address a launch by `creator` with this salt, name and symbol would deploy.
     function predictToken(address creator, bytes32 salt, string calldata name, string calldata symbol)
         external
@@ -219,6 +243,9 @@ interface ISVLaunchpad {
 
     /// @notice Whether `account` may launch under the current gate, by the fail-closed rule of section 4.7.
     function isAllowedLauncher(address account) external view returns (bool);
+
+    /// @notice Launches `account` made on the current UTC day.
+    function launchesToday(address account) external view returns (uint256);
 
     /// @notice The bounds and creation fee of a quote currency; all zeros when not allowed.
     function currency(address quote) external view returns (CurrencyConfig memory);
