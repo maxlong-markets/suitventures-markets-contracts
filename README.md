@@ -122,17 +122,31 @@ different money in different currencies: `"1000000"` is USD 1 of USDG, which has
 millionth of a token in an 18-decimal stock. A non-zero creation fee therefore needs a value per currency, set
 with `setCurrency`, not this single field.
 
-**Deploy, after Kobe's review.** Dry run against a local anvil fork of chain 4663, then:
+**Deploy, after Kobe's review.** Dry run first against a local anvil fork of chain 4663. In one terminal:
 
 ```sh
-forge script script/DeployLaunchpad.s.sol --rpc-url robinhood --account <keystore name> --broadcast
+anvil --fork-url "$ROBINHOOD_RPC_URL" --chain-id 4663
+```
+
+In another, the same command the real deploy uses, pointed at anvil:
+
+```sh
+forge script script/DeployLaunchpad.s.sol --rpc-url http://127.0.0.1:8545 --account <keystore name> --broadcast
+```
+
+Read the printed bounds and settings. When they are right, deploy for real. `--slow` sends each transaction only
+after the one before it is mined, so a failed transaction stops the run before the next one is sent:
+
+```sh
+forge script script/DeployLaunchpad.s.sol --rpc-url robinhood --account <keystore name> --broadcast --slow
 ```
 
 The broadcaster deploys with itself as owner, allows every currency, then transfers ownership to `OWNER`. When
-`OWNER` is another key, it must call `acceptOwnership`. The script refuses a zero `OWNER`, which is the placeholder
-in `.env.example`, so the broadcaster can never stay owner by mistake. Verify through Sourcify with the constructor arguments
-PoolManager, Permit2, the broadcaster, `FEE_WALLET` and `LAUNCHER_GATE`, and with the optimizer runs the launch
-profile in `foundry.toml` sets, 200:
+`OWNER` is another key, it must call `acceptOwnership`. The script refuses a zero `OWNER`, which is the
+placeholder in `.env.example`, so the broadcaster can never stay owner by mistake.
+
+Verify through Sourcify with the constructor arguments PoolManager, Permit2, the broadcaster, `FEE_WALLET` and
+`LAUNCHER_GATE`, and with the optimizer runs the launch profile in `foundry.toml` sets, 200:
 
 ```sh
 forge verify-contract <address> src/SVLaunchpad.sol:SVLaunchpad --chain-id 4663 --verifier sourcify \
@@ -141,6 +155,18 @@ forge verify-contract <address> src/SVLaunchpad.sol:SVLaunchpad --chain-id 4663 
     0x8366a39CC670B4001A1121B8F6A443A643e40951 0x000000000022D473030F116dDEE9F6B43aC78BA3 \
     <broadcaster> "$FEE_WALLET" "$LAUNCHER_GATE")"
 ```
+
+**Accepted risks, for MAXLONG's sign-off.** None of these is a bug; each is a choice the contract makes on
+purpose, and MAXLONG should agree to each before launch.
+
+| Risk | What it means | What limits it |
+|---|---|---|
+| Hook set by the owner | Every launch made while a hook is set gets that hook in its pool for good; a pool never changes its hook | Move ownership to MAXLONG's Safe early. The frontend refuses to launch while `hook()` is not zero |
+| No on-chain bound at launch | A launch takes the creator share and hook in force when it lands. The launch call carries no expected values for them | The creator is protected only by what the form reads just before signing |
+| A quote that pauses or blocklists | If a currency pauses transfers or blocklists the launchpad, collection freezes for both currencies of every launch in that currency | Only currencies the owner allows can be used, so the allowlist is trusted |
+| A hostile quote | A quote that burns gas or sends a huge reply can make a collection revert | The same trusted allowlist |
+| Rounding dust | Each collection rounds the creator's share down, and the remainder goes to the fee wallet | Less than one raw unit per currency per collection |
+| No external audit | The contracts are reviewed and tested here, not audited by an outside firm | 100 % coverage on `src/`, fuzz, invariant and fork tests |
 
 ## Layout
 
