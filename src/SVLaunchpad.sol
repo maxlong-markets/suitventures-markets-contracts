@@ -73,6 +73,12 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
     uint256 private constant BPS = 10_000;
     /// @dev Gas allowance for reading the gate's `balanceOf`, as SVRouter's `HOLDER_CHECK_GAS`.
     uint256 private constant GATE_CHECK_GAS = 100_000;
+    /// @dev The hook flags `setHook` refuses (spec section 4.9): both remove-liquidity flags, since the fee poke
+    ///      is a zero-delta remove, and all four returns-delta flags.
+    uint160 private constant REFUSED_HOOK_FLAGS =
+        Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG
+        | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
     uint16 private constant INITIAL_CREATOR_SHARE_BPS = 7_000;
     uint16 private constant INITIAL_FIRST_BUY_CAP_BPS = 2_000;
     uint8 private constant INITIAL_DAILY_LAUNCH_LIMIT = 5;
@@ -598,17 +604,18 @@ contract SVLaunchpad is ISVLaunchpad, Ownable2Step, ReentrancyGuard {
 
     /// @inheritdoc ISVLaunchpad
     /// @dev Spec section 4.9: zero, or an address with code that v4 accepts for a static-fee pool and that carries
-    ///      neither returns-delta flag on liquidity, which would let a hook change what the position pays at the
-    ///      mint or skim what it collects. Applies to later launches only: a launch's hook is in its pool key.
+    ///      no remove-liquidity flag and no returns-delta flag. The fee poke is a zero-delta remove, so a
+    ///      remove-liquidity hook could freeze `collectFees` for every launch made under it; a returns-delta hook
+    ///      could change what the position pays at the mint, skim what it collects, or change what a trade pays
+    ///      or receives, the creator's first buy included. An anti-snipe hook needs none of these. Applies to later
+    ///      launches only: a launch's hook is in its pool key.
     function setHook(address newHook) external onlyOwner {
-        if (newHook != address(0)) {
-            IHooks h = IHooks(newHook);
-            if (
-                newHook.code.length == 0 || !h.isValidHookAddress(POOL_FEE)
-                    || h.hasPermission(Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG)
-                    || h.hasPermission(Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG)
-            ) revert HookNotAllowed();
-        }
+        if (
+            newHook != address(0)
+                && (newHook.code.length == 0
+                    || !IHooks(newHook).isValidHookAddress(POOL_FEE)
+                    || uint160(newHook) & REFUSED_HOOK_FLAGS != 0)
+        ) revert HookNotAllowed();
         hook = newHook;
         emit HookChanged(newHook);
     }

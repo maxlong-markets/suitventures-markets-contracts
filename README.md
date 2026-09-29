@@ -92,7 +92,7 @@ the head; a block a few hundred below it works.
 | Fact | Value |
 |---|---|
 | `SVLaunchpad` runtime size at 1,000,000 optimizer runs | 31,328 bytes, over the 24,576-byte limit |
-| `SVLaunchpad` runtime size as built | 24,300 bytes at 200 optimizer runs, 276 under the limit |
+| `SVLaunchpad` runtime size as built | 24,289 bytes at 200 optimizer runs, 287 under the limit; the stop rule is 24,448 bytes, 128 under |
 | `SVLaunchToken` runtime size | 1,969 bytes as built at 200 runs, 2,558 bytes at 1,000,000 runs |
 | `SVRouter` runtime size | 7,647 bytes, unchanged |
 | Gas of a launch with a first buy | 1,138,477 in the unit suite, normal build |
@@ -161,7 +161,7 @@ purpose, and MAXLONG should agree to each before launch.
 
 | Risk | What it means | What limits it |
 |---|---|---|
-| Hook set by the owner | Every launch made while a hook is set gets that hook in its pool for good; a pool never changes its hook | Move ownership to MAXLONG's Safe early. The frontend refuses to launch while `hook()` is not zero |
+| Hook set by the owner | Every launch made while a hook is set gets that hook in its pool for good; a pool never changes its hook | Move ownership to MAXLONG's Safe early. The frontend refuses to launch while `hook()` is not zero. `setHook` refuses any hook with a remove-liquidity flag, which could block fee collection, or a returns-delta flag, which could change what a trade or the position pays |
 | No on-chain bound at launch | A launch takes the creator share and hook in force when it lands. The launch call carries no expected values for them | The creator is protected only by what the form reads just before signing |
 | A quote that pauses or blocklists | If a currency pauses transfers or blocklists the launchpad, collection freezes for both currencies of every launch in that currency | Only currencies the owner allows can be used, so the allowlist is trusted |
 | A hostile quote | A quote that burns gas or sends a huge reply can make a collection revert | The same trusted allowlist |

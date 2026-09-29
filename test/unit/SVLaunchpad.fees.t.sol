@@ -7,6 +7,7 @@ import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {ISVLaunchpad} from "../../src/interfaces/ISVLaunchpad.sol";
 import {MockQuirkyERC20} from "../mocks/MockQuirkyERC20.sol";
+import {MockBeforeSwapHook} from "../mocks/MockBeforeSwapHook.sol";
 import {SVLaunchpadTestBase} from "./SVLaunchpad.t.sol";
 
 /// @notice Spec section 4.6: `collectFees` pokes the position with a zero liquidity delta, takes the fees into
@@ -365,6 +366,26 @@ contract SVLaunchpadFeesTest is SVLaunchpadTestBase {
         assertEq(launchpad.getLaunch(token).payout, next, "payout changes still work");
         assertEq(launchpad.getLaunch(token).hook, address(0), "the launch keeps its hookless key");
         assertEq(_positionLiquidity(token), launchpad.getLaunch(token).liquidity, "the position is untouched");
+    }
+
+    /// @dev Audit finding L-01 regression: a launch made under an allowed hook, here a live before-swap-only hook
+    ///      as an anti-snipe hook would be, still trades and still collects through the zero-delta fee poke.
+    function test_a_launch_under_an_allowed_before_swap_hook_trades_and_collects_fees() public {
+        address hookAddress = _hookAt(Hooks.BEFORE_SWAP_FLAG);
+        vm.etch(hookAddress, address(new MockBeforeSwapHook()).code);
+        vm.prank(owner);
+        launchpad.setHook(hookAddress);
+        address token = _launchFree(address(usdg), USDG_MIN, true);
+        assertEq(launchpad.getLaunch(token).hook, hookAddress, "the launch carries the hook");
+        assertGt(_swap(token, true, 1_000e6), 0, "the buy went through the hook");
+        assertEq(MockBeforeSwapHook(hookAddress).swaps(), 1, "the hook saw the trade");
+        ISVLaunchpad.PendingFees memory f = launchpad.uncollectedFees(token);
+        assertGt(f.quoteFees, 0, "the trade earned a fee");
+        uint256 creatorBefore = usdg.balanceOf(creator);
+        vm.prank(stranger);
+        launchpad.collectFees(token);
+        assertEq(usdg.balanceOf(creator) - creatorBefore, f.quoteToPayout, "the payout was paid");
+        assertEq(usdg.balanceOf(feeWallet), f.quoteToFeeWallet, "and the fee wallet");
     }
 
     function test_a_sell_before_the_first_buy_costs_nothing_leaves_nothing_to_collect_and_changes_no_price() public {

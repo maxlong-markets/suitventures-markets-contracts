@@ -573,10 +573,12 @@ contract SVLaunchpadSettingsTest is SVLaunchpadTestBase {
         vm.prank(owner);
         launchpad.setHook(valid);
         assertEq(launchpad.hook(), valid, "valid hook set");
-        address removeOnly = _hookAt(Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG);
+        address antiSnipe = _hookAt(Hooks.BEFORE_SWAP_FLAG);
+        vm.expectEmit(true, true, true, true, address(launchpad));
+        emit ISVLaunchpad.HookChanged(antiSnipe);
         vm.prank(owner);
-        launchpad.setHook(removeOnly);
-        assertEq(launchpad.hook(), removeOnly, "remove-liquidity hooks without the returns-delta flag are allowed");
+        launchpad.setHook(antiSnipe);
+        assertEq(launchpad.hook(), antiSnipe, "a before-swap-only hook, the typical anti-snipe hook, is allowed");
         vm.prank(owner);
         launchpad.setHook(address(0));
         assertEq(launchpad.hook(), address(0), "back to hookless");
@@ -596,6 +598,25 @@ contract SVLaunchpadSettingsTest is SVLaunchpadTestBase {
             _hookAt(Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG)
         ];
         for (uint256 i = 0; i < refused.length; i++) {
+            vm.prank(owner);
+            vm.expectRevert(ISVLaunchpad.HookNotAllowed.selector);
+            launchpad.setHook(refused[i]);
+        }
+        assertEq(launchpad.hook(), address(0), "unchanged");
+    }
+
+    function test_setHook_reverts_HookNotAllowed_for_hooks_that_can_block_the_fee_poke_or_change_swap_amounts() public {
+        address[4] memory refused = [
+            // valid for v4, refused by the launchpad: the zero-delta fee poke runs the remove-liquidity hooks,
+            // so either one could freeze collectFees for every launch made under the hook
+            _hookAt(Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG),
+            _hookAt(Hooks.AFTER_REMOVE_LIQUIDITY_FLAG),
+            // valid for v4, refused by the launchpad: could change what a trade pays or receives
+            _hookAt(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG),
+            _hookAt(Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG)
+        ];
+        for (uint256 i = 0; i < refused.length; i++) {
+            assertTrue(Hooks.isValidHookAddress(IHooks(refused[i]), 10_000), "valid for v4 itself");
             vm.prank(owner);
             vm.expectRevert(ISVLaunchpad.HookNotAllowed.selector);
             launchpad.setHook(refused[i]);

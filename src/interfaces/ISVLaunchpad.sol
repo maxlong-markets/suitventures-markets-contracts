@@ -223,7 +223,8 @@ interface ISVLaunchpad {
     /// @notice Owner only. The ERC-721 whose holders may launch; zero means anyone.
     function setLauncherGate(address gate) external;
 
-    /// @notice Owner only. The hook of later launches' pools: zero, or a hook as spec section 4.9 requires.
+    /// @notice Owner only. The hook of later launches' pools: zero, or a hook with code that v4 accepts for a
+    ///         static-fee pool and that has no remove-liquidity flag and no returns-delta flag (spec section 4.9).
     function setHook(address hook) external;
 
     /// @notice Owner only. Allow a quote currency with valuation bounds and a creation fee; `maxValuation == 0`
