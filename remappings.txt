@@ -4,3 +4,4 @@ forge-std/=lib/forge-std/src/
 @uniswap/v4-periphery/=lib/v4-periphery/
 @uniswap/universal-router/=lib/universal-router/
 permit2/=lib/permit2/
+solmate/=lib/v4-core/lib/solmate/
