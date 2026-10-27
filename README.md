@@ -197,8 +197,10 @@ suite trades the three real pools in both currency orders through the deployed P
 and the V4 Quoter agrees to the wei. The launchpad fork suite launches in USDG and NVDA and trades through
 SVRouter. `uncollectedFees` matches StateView there, which proves the PoolManager's storage layout.
 
-CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the size build, `forge fmt --check` and the
-offline suite on every push and pull request.
+CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs the size build and the offline suite on every
+push and pull request. `forge fmt --check` runs locally on the forge 1.4 nightly the repository is formatted with: the
+stable formatter wraps one constant in `src/SVLaunchpad.sol` differently, and `src/` is deployed source kept
+byte-identical, since a whitespace change would alter the metadata hash.
 
 ## How to run
 
