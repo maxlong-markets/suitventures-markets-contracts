@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  forge:
+    name: Build, format, offline tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # solmate is remapped to v4-core's nested copy, so nested submodules are needed.
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Build with sizes (fails on an EIP-170 overflow in src)
+        run: forge build --sizes --skip test --skip script
+
+      - name: Format check
+        run: forge fmt --check
+
+      - name: Offline tests (fork tests need an RPC and are excluded)
+        run: forge test --no-match-path 'test/fork/*'
